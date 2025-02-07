@@ -4,18 +4,16 @@ A collection of helper nodes for ComfyUI with smart functionality.
 
 ## Nodes
 
-### Smart Format String
-### Smart Format String (10 params)
+### Smart Format String, Smart Format String (10 params)
 A node that formats a string with placeholders for input parameters and date/time.
 
-![SmartFormatString](docs/images/SmartFormatString.png)
+![SmartFormatString](img/SmartFormatString.png)
 
-### Smart HV LoRA Select
-### Smart HV LoRA Stack
+### Smart HV LoRA Select, Smart HV LoRA Stack
 Nodes for selecting and stacking HunyuanVideo LoRA files.
 Also outputs a human-readable string of the LoRA file name and parameters (for example to save to a file).
 
-![SmartHVLoraSelect](docs/images/SmartHVLora.png)
+![SmartHVLoraSelect](img/SmartHVLora.png)
 
 ## Installation
 
