@@ -3,18 +3,21 @@
 import { app } from '../../scripts/app.js'
 import { api } from '../../scripts/api.js'   
 
+const SMART_HV_LORA_STACK_NAME = "Smart HV LoRA Stack";
+const SMART_HV_LORA_STACK_COUNT_WIDGET = "lora_count";
+
 const nodeWidgetHandlers = {
     "SmartHVLoraStack": {
-        'lora_count': handleSmartHVLoraStackCount
+        [SMART_HV_LORA_STACK_COUNT_WIDGET]: handleSmartHVLoraStackCount
     }
 };
 
 function handleSmartHVLoraStackCount(node, widget) {
-    handleVisibility(node, widget.value, "Smart HV LoRA Stack");
+    handleVisibility(node, widget.value, SMART_HV_LORA_STACK_NAME);
 }
 
 function handleVisibility(node, count, type) {
-    if (type === "Smart HV LoRA Stack") {
+    if (type === SMART_HV_LORA_STACK_NAME) {
         //console.log("Smart: handleVisibility called for", type, "with count", count);
         for (let i = 1; i <= 50; i++) {
             const show = i <= count;
@@ -54,6 +57,14 @@ function toggleWidget(node, widget, show = false) {
     }
 }
 
+function setupVisibilityHandler(node, countWidgetName, blockType) {
+    const countWidget = node.widgets.find(w => w.name === countWidgetName);
+    if (countWidget) {
+        handleVisibility(node, countWidget.value, blockType);
+    }
+    return countWidget;
+}
+
 // Update the registerExtension implementation
 app.registerExtension({
     name: "SmartHelperNodes",
@@ -82,11 +93,11 @@ app.registerExtension({
                 const result = onNodeCreated?.apply(this, arguments);
                 
                 // Set up widget callbacks
-                const loraCountWidget = this.widgets.find(w => w.name === "lora_count");
+                const loraCountWidget = setupVisibilityHandler(this, SMART_HV_LORA_STACK_COUNT_WIDGET, SMART_HV_LORA_STACK_NAME);
                 
                 if (loraCountWidget) {
                     loraCountWidget.callback = () => {
-                        handleVisibility(this, loraCountWidget.value, "Smart HV LoRA Stack");
+                        handleVisibility(this, loraCountWidget.value, SMART_HV_LORA_STACK_NAME);
                     };
                 }
                 
@@ -107,8 +118,23 @@ app.registerExtension({
                 
                 // Initial setup - hide widgets based on current count
                 if (loraCountWidget) {
-                    handleVisibility(this, loraCountWidget.value, "Smart HV LoRA Stack");
+                    handleVisibility(this, loraCountWidget.value, SMART_HV_LORA_STACK_NAME);
                 }
+
+                // Handle workflow switching and initial load
+                const onConnectionsChange = this.onConnectionsChange;
+                this.onConnectionsChange = function() {
+                    const result = onConnectionsChange?.apply(this, arguments);
+                    setupVisibilityHandler(this, SMART_HV_LORA_STACK_COUNT_WIDGET, SMART_HV_LORA_STACK_NAME);
+                    return result;
+                };
+
+                const onNodeGraphConfigure = this.onConfigure;
+                this.onConfigure = function() {
+                    const result = onNodeGraphConfigure?.apply(this, arguments);
+                    setupVisibilityHandler(this, SMART_HV_LORA_STACK_COUNT_WIDGET, SMART_HV_LORA_STACK_NAME);
+                    return result;
+                };                
 
                 return result;
             };
