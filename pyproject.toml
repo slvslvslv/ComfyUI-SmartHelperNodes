@@ -1,13 +1,15 @@
 [project]
-name = "comfyui-SmartHelperNodes"
-description = "A collection of helper nodes for ComfyUI with smart functionality, including string formatting with parameters and date/time, and HunyuanVideo LoRA management tools."
+name = "smarthelpernodes"
+description = "NODES: Smart HunyuanVideo Lora Select, Smart HunyuanVideo Lora StackSmart Format String, Smart Format String (10 params)"
 version = "1.0.0"
-license = { file = "LICENSE" }
+license = {file = "LICENSE"}
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/soulburner/ComfyUI-SmartHelperNodes"
+Repository = "https://github.com/slvslvslv/ComfyUI-SmartHelperNodes"
+#  Used by Comfy Registry https://comfyregistry.org
 
 [tool.comfy]
-PublisherId = "soulburner"
-DisplayName = "Smart Helper Nodes" 
+PublisherId = ""
+DisplayName = "ComfyUI-SmartHelperNodes"
+Icon = ""
