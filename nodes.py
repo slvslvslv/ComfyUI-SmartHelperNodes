@@ -193,13 +193,57 @@ class SmartFormatString:
 class SmartFormatString10(SmartFormatString):
     max_param_num = 10  # Override with 10 parameters
 
-# Add all your node classes here
+
+
+class SmartSaveText:
+    """
+    A node that saves text to a file, creating directories as needed and appending to existing files.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True}),
+                "filename": ("STRING", {"default": "output.txt"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "save_text"
+    CATEGORY = "SmartHelperNodes"
+    OUTPUT_NODE = True
+
+    def save_text(self, text, filename):
+        # Convert relative path to absolute path within ComfyUI's output directory
+        output_dir = folder_paths.get_output_directory()
+        full_path = os.path.join(output_dir, filename)
+        
+        # Create directories if they don't exist
+        directory = os.path.dirname(full_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+            
+        # Append to file (or create if doesn't exist)
+        with open(full_path, "a+", encoding="utf-8") as f:
+            # Add newline if file is not empty and doesn't end with one
+            if f.tell() != 0:
+                f.seek(0)
+                content = f.read()
+                if content and not content.endswith('\n'):
+                    f.write('\n')
+            # Write the new text
+            f.write(text)
+            
+        return (text,)
+
 
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
     "SmartHVLoraStack": SmartHVLoraStack,
     "SmartFormatString": SmartFormatString,
     "SmartFormatString10": SmartFormatString10,
+    "SmartSaveText": SmartSaveText,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -207,4 +251,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartHVLoraStack": "Smart HunyuanVideo Lora Stack",
     "SmartFormatString": "Smart Format String",
     "SmartFormatString10": "Smart Format String (10 params)",
+    "SmartSaveText": "Smart Save Text File",
 }
