@@ -237,6 +237,28 @@ class SmartSaveText:
             
         return (text,)
 
+class SmartRemoveComments:
+    """
+    A node that removes all lines that start with // (with optional leading whitespace)
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "remove_comments"
+    CATEGORY = "SmartHelperNodes"
+
+    def remove_comments(self, text):
+        # Split text into lines, filter out comment lines, and rejoin
+        lines = text.splitlines()
+        filtered_lines = [line for line in lines if not line.strip().startswith("//")]
+        return ("\n".join(filtered_lines),)
 
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
@@ -244,6 +266,7 @@ NODE_CLASS_MAPPINGS = {
     "SmartFormatString": SmartFormatString,
     "SmartFormatString10": SmartFormatString10,
     "SmartSaveText": SmartSaveText,
+    "SmartRemoveComments": SmartRemoveComments,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -252,4 +275,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartFormatString": "Smart Format String",
     "SmartFormatString10": "Smart Format String (10 params)",
     "SmartSaveText": "Smart Save Text File",
+    "SmartRemoveComments": "Smart Remove Comments",
 }
