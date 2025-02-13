@@ -239,7 +239,7 @@ class SmartSaveText:
 
 class SmartRemoveComments:
     """
-    A node that removes all lines that start with // (with optional leading whitespace)
+    A node that removes all comments starting with // anywhere in the line
     """
     
     @classmethod
@@ -255,10 +255,19 @@ class SmartRemoveComments:
     CATEGORY = "SmartHelperNodes"
 
     def remove_comments(self, text):
-        # Split text into lines, filter out comment lines, and rejoin
+        # Split text into lines, remove comment portions, and rejoin
         lines = text.splitlines()
-        filtered_lines = [line for line in lines if not line.strip().startswith("//")]
-        return ("\n".join(filtered_lines),)
+        processed_lines = []
+        for line in lines:
+            # Find the position of // if it exists
+            comment_pos = line.find('//')
+            if comment_pos != -1:
+                # Keep only the part before the comment
+                line = line[:comment_pos].rstrip()
+            # Only add non-empty lines after comment removal
+            if line.strip():
+                processed_lines.append(line)
+        return ("\n".join(processed_lines),)
 
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
