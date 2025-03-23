@@ -1,5 +1,6 @@
 import os
 import folder_paths
+import comfy
 
 # Custom Nodes for ComfyUI
 # Note: All nodes in this file should use the "Smart" prefix in their names
@@ -193,8 +194,6 @@ class SmartFormatString:
 class SmartFormatString10(SmartFormatString):
     max_param_num = 10  # Override with 10 parameters
 
-
-
 class SmartSaveText:
     """
     A node that saves text to a file, creating directories as needed and appending to existing files.
@@ -269,6 +268,59 @@ class SmartRemoveComments:
                 processed_lines.append(line)
         return ("\n".join(processed_lines),)
 
+class SmartLoadLoRA:
+    def __init__(self):
+        self.loaded_lora = None
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "The diffusion model the LoRA will be applied to."}),
+                "clip": ("CLIP", {"tooltip": "The CLIP model the LoRA will be applied to."}),
+                "lora_name": (folder_paths.get_filename_list("loras"), {"tooltip": "The name of the LoRA."}),
+                "strength_model": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01, "tooltip": "How strongly to modify the diffusion model. This value can be negative."}),
+                "strength_clip": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01, "tooltip": "How strongly to modify the CLIP model. This value can be negative."}),
+            },
+            "optional": {
+                "lora_string": ("STRING", {"forceInput": True, "default": ""})
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING")
+    RETURN_NAMES = ("model", "clip", "lora_string")
+    FUNCTION = "load_lora"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Load a LoRA model (just like the core LoRA loader), but also outputs the model name and strength to a formatted string."
+
+    def load_lora(self, model, clip, lora_name, strength_model, strength_clip, lora_string=""):
+        if strength_model == 0 and strength_clip == 0:
+            return (model, clip, lora_string)
+
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+        lora = None
+        if self.loaded_lora is not None:
+            if self.loaded_lora[0] == lora_path:
+                lora = self.loaded_lora[1]
+            else:
+                self.loaded_lora = None
+
+        if lora is None:
+            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            self.loaded_lora = (lora_path, lora)
+
+        model_lora, clip_lora = comfy.sd.load_lora_for_models(model, clip, lora, strength_model, strength_clip)
+        
+        # Create formatted string output
+        lora_name_without_ext = lora_name.split(".")[0]
+        new_lora_string = f"{lora_name_without_ext}, model_str:{strength_model}, clip_str:{strength_clip}"
+        if lora_string:
+            final_lora_string = f"{lora_string}\n{new_lora_string}"
+        else:
+            final_lora_string = new_lora_string
+            
+        return (model_lora, clip_lora, final_lora_string)
+
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
     "SmartHVLoraStack": SmartHVLoraStack,
@@ -276,6 +328,7 @@ NODE_CLASS_MAPPINGS = {
     "SmartFormatString10": SmartFormatString10,
     "SmartSaveText": SmartSaveText,
     "SmartRemoveComments": SmartRemoveComments,
+    "SmartLoadLoRA": SmartLoadLoRA,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -285,4 +338,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartFormatString10": "Smart Format String (10 params)",
     "SmartSaveText": "Smart Save Text File",
     "SmartRemoveComments": "Smart Remove Comments",
+    "SmartLoadLoRA": "Smart Load LoRA",
 }
