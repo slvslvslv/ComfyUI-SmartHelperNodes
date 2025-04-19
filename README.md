@@ -4,6 +4,15 @@ A collection of helper nodes for ComfyUI with smart functionality.
 
 ## Nodes
 
+![SmartPrompt](img/SmartPrompt.png)
+
+### Smart Prompt
+A node that provides syntax highlighting for prompts, with support for comments (//), punctuation and float (weight) values.
+The node also removes all comments from the output string.
+
+### Smart Remove Comments
+A simple node that removes // comments from the string.
+
 ### Smart Format String, Smart Format String (10 params)
 A node that formats a string with placeholders for input parameters and date/time.
 

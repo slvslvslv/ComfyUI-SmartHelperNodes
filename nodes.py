@@ -1,6 +1,7 @@
 import os
 import folder_paths
 import comfy
+import comfy.sd # Added import for CLIP type access
 
 # Custom Nodes for ComfyUI
 # Note: All nodes in this file should use the "Smart" prefix in their names
@@ -321,6 +322,51 @@ class SmartLoadLoRA:
             
         return (model_lora, clip_lora, final_lora_string)
 
+class SmartPrompt:
+    """
+    A node that provides a multiline text input, removes comments, and optionally encodes it using a CLIP model.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True, "default": "", "tooltip": "Enter your prompt text. Lines with // comments will be cleaned up."}),
+            },
+            "optional": {
+                "clip": ("CLIP", {"tooltip": "Optional CLIP model for encoding the text."})
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "CONDITIONING")
+    RETURN_NAMES = ("text", "conditioning")
+    FUNCTION = "process_prompt"
+    CATEGORY = "SmartHelperNodes"
+
+    def process_prompt(self, text, clip=None):
+        # Split text into lines, remove comment portions, and rejoin
+        lines = text.splitlines()
+        processed_lines = []
+        for line in lines:
+            # Find the position of // if it exists
+            comment_pos = line.find('//')
+            if comment_pos != -1:
+                # Keep only the part before the comment
+                line = line[:comment_pos].rstrip()
+            # Only add non-empty lines after comment removal
+            if line.strip():
+                processed_lines.append(line)
+        
+        processed_text = "\n".join(processed_lines)
+        
+        conditioning = None
+        if clip is not None:
+            # Based on CLIPTextEncode example
+            tokens = clip.tokenize(processed_text)
+            conditioning = clip.encode_from_tokens_scheduled(tokens)
+            
+        return (processed_text, conditioning)
+
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
     "SmartHVLoraStack": SmartHVLoraStack,
@@ -329,6 +375,7 @@ NODE_CLASS_MAPPINGS = {
     "SmartSaveText": SmartSaveText,
     "SmartRemoveComments": SmartRemoveComments,
     "SmartLoadLoRA": SmartLoadLoRA,
+    "SmartPrompt": SmartPrompt,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -339,4 +386,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartSaveText": "Smart Save Text File",
     "SmartRemoveComments": "Smart Remove Comments",
     "SmartLoadLoRA": "Smart Load LoRA",
+    "SmartPrompt": "Smart Prompt",
 }

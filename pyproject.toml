@@ -1,7 +1,7 @@
 [project]
 name = "smarthelpernodes"
-description = "NODES: Smart HunyuanVideo Lora Select, Smart HunyuanVideo Lora StackSmart Format String, Smart Format String (10 params)"
-version = "1.0.0"
+description = "NODES: Smart Prompt (with syntax highlight and comment stripping), Smart HunyuanVideo Lora Select, Smart HunyuanVideo Lora StackSmart Format String, Smart Format String (10 params)"
+version = "1.0.2"
 license = {file = "LICENSE"}
 dependencies = []
 
