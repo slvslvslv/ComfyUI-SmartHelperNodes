@@ -11,7 +11,10 @@ The node also removes all comments from the output string.
 ![SmartPrompt](img/SmartPrompt.png)
 
 ### Smart Remove Comments
+
 A simple node that removes // comments from the string.
+
+![SmartRemoveComments](img/SmartRemoveComments.png)
 
 ### Smart Format String, Smart Format String (10 params)
 A node that formats a string with placeholders for input parameters and date/time.
