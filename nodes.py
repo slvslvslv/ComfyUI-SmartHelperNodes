@@ -2,6 +2,8 @@ import os
 import folder_paths
 import comfy
 import comfy.sd # Added import for CLIP type access
+import json
+import sys
 
 # Custom Nodes for ComfyUI
 # Note: All nodes in this file should use the "Smart" prefix in their names
@@ -24,6 +26,111 @@ def format_lora_string(lora_name, strength, blocks_type, existing_string=""):
     if existing_string:
         return f"{existing_string}\n{new_lora_string}"
     return new_lora_string
+
+# Helper function to format objects with binary data handling
+def format_object(obj, indent=0, max_depth=5, path=""):
+    if max_depth <= 0:
+        return " " * indent + "[max depth reached]"
+    
+    # Handle None
+    if obj is None:
+        return " " * indent + "None"
+    
+    # Get type and handle binary data
+    obj_type = type(obj)
+    
+    # Check for binary data (bytes, bytearray, memoryview)
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        size_bytes = sys.getsizeof(obj)
+        size_mb = size_bytes / (1024 * 1024)
+        if size_mb >= 1:
+            return f"{' ' * indent}[...binary data ({size_mb:.2f} MB)...]"
+        else:
+            size_kb = size_bytes / 1024
+            return f"{' ' * indent}[...binary data ({size_kb:.2f} KB)...]"
+    
+    # Handle strings
+    if isinstance(obj, str):
+        if len(obj) > 1000:  # Truncate long strings
+            return f"{' ' * indent}\"{obj[:1000]}...\""
+        return f"{' ' * indent}\"{obj}\""
+    
+    # Handle basic types
+    if isinstance(obj, (int, float, bool)):
+        return f"{' ' * indent}{obj}"
+    
+    # Handle dictionaries
+    if isinstance(obj, dict):
+        if not obj:
+            return f"{' ' * indent}{{}}"
+        
+        result = [f"{' ' * indent}{{"]
+        for k, v in obj.items():
+            key_str = repr(k) if isinstance(k, str) else str(k)
+            next_path = f"{path}.{key_str}" if path else key_str
+            
+            # Format value with increased indentation
+            value_str = format_object(v, indent + 2, max_depth - 1, next_path)
+            
+            # Remove the indentation from value_str as we'll add it manually
+            if value_str.startswith(" " * (indent + 2)):
+                value_str = value_str[(indent + 2):]
+                
+            result.append(f"{' ' * (indent + 2)}{key_str}: {value_str}")
+        
+        result.append(f"{' ' * indent}}}")
+        return "\n".join(result)
+    
+    # Handle lists, tuples, sets
+    if isinstance(obj, (list, tuple, set)):
+        if not obj:
+            return f"{' ' * indent}[]" if isinstance(obj, list) else \
+                   f"{' ' * indent}()" if isinstance(obj, tuple) else \
+                   f"{' ' * indent}set()"
+        
+        brackets = "[]" if isinstance(obj, list) else "()" if isinstance(obj, tuple) else "set([])"
+        result = [f"{' ' * indent}{brackets[0]}"]
+        
+        for i, item in enumerate(obj):
+            next_path = f"{path}[{i}]" if path else f"[{i}]"
+            item_str = format_object(item, indent + 2, max_depth - 1, next_path)
+            
+            # Remove the indentation from item_str as we'll add it manually
+            if item_str.startswith(" " * (indent + 2)):
+                item_str = item_str[(indent + 2):]
+                
+            result.append(f"{' ' * (indent + 2)}{item_str},")
+        
+        result.append(f"{' ' * indent}{brackets[1]}")
+        return "\n".join(result)
+    
+    # For other objects, try to get dict representation or use str()
+    try:
+        if hasattr(obj, '__dict__') and obj.__dict__:
+            result = [f"{' ' * indent}{obj.__class__.__name__} {{"]
+            for k, v in obj.__dict__.items():
+                # Skip private attributes
+                if k.startswith('_'):
+                    continue
+                    
+                next_path = f"{path}.{k}" if path else k
+                
+                # Format value with increased indentation
+                value_str = format_object(v, indent + 2, max_depth - 1, next_path)
+                
+                # Remove the indentation from value_str as we'll add it manually
+                if value_str.startswith(" " * (indent + 2)):
+                    value_str = value_str[(indent + 2):]
+                    
+                result.append(f"{' ' * (indent + 2)}{k}: {value_str}")
+            
+            result.append(f"{' ' * indent}}}")
+            return "\n".join(result)
+    except:
+        pass
+    
+    # Fallback to simple string representation
+    return f"{' ' * indent}{str(obj)}"
 
 class SmartHVLoraSelect:
     @classmethod
@@ -191,6 +298,14 @@ class SmartFormatString:
             result = result.replace(f"%{i}", str_value)
             
         return (result,)
+        
+    @classmethod
+    def IS_CHANGED(cls, string_format, unique_id=None, **kwargs):
+        # Return a value that's always different to force re-evaluation when time-based placeholders are used
+        import time
+        if any(x in string_format for x in ['%H', '%M', '%S', '%y', '%m', '%d']):
+            return time.time()
+        return 0
 
 class SmartFormatString10(SmartFormatString):
     max_param_num = 10  # Override with 10 parameters
@@ -366,6 +481,101 @@ class SmartPrompt:
             conditioning = clip.encode_from_tokens_scheduled(tokens)
             
         return (processed_text, conditioning)
+    
+class SmartModelOrLoraToString:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "optional": {
+                "model": ("WANVIDEOMODEL", {"default": None}),
+                "lora": ("WANVIDLORA", {"default": None}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output_string",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Converts a model and/or LORA object to a formatted string"
+
+    def process(self, model=None, lora=None):
+        output_lines = []
+        
+        # Process model if provided
+        if model is not None:
+            try:
+                # Access the model name from the pipeline dictionary in the nested structure
+                if hasattr(model, 'model') and hasattr(model.model, 'pipeline') and isinstance(model.model.pipeline, dict) and 'model_name' in model.model.pipeline:
+                    model_name = model.model.pipeline['model_name']
+                    # Remove .safetensors extension if present
+                    if model_name.endswith('.safetensors'):
+                        model_name = model_name[:-12]  # Remove the last 12 characters ('.safetensors')
+                    output_lines.append(f"MODEL: {model_name}")
+                else:
+                    output_lines.append("MODEL: unknown")
+            except Exception as e:
+                output_lines.append(f"MODEL: unknown ({str(e)})")
+        
+        # Process lora if provided
+        if lora is not None:
+            for lora_item in lora:
+                name = lora_item["name"]
+                strength = lora_item["strength"]
+                output_lines.append(f"LORA: {name} : {strength:.2f}")
+            
+        return ("\n".join(output_lines),)
+
+class SmartShowAnything:
+    """
+    A node that displays any type of input as text and returns it unchanged.
+    Supports recursive object unfolding and proper handling of binary data.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {}, 
+                "optional": {"anything": (any_type, {})},
+                "hidden": {"unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"}
+               }
+
+    RETURN_TYPES = (any_type,)
+    RETURN_NAMES = ('output',)
+    INPUT_IS_LIST = True
+    OUTPUT_NODE = True
+    FUNCTION = "log_input"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Displays any type of content as text in the UI and passes it through unchanged. Also supports recursive object unfolding."
+
+    def log_input(self, unique_id=None, extra_pnginfo=None, **kwargs):
+        values = []
+        if "anything" in kwargs:
+            for val in kwargs['anything']:
+                try:
+                    if type(val) is str:
+                        values.append(val)
+                    elif type(val) is list:
+                        values = val
+                    else:
+                        # Use the new format_object function for recursive object formatting
+                        formatted_val = format_object(val, max_depth=5)
+                        values.append(formatted_val)
+                except Exception as e:
+                    values.append(f"Error formatting object: {str(e)}")
+                    pass
+
+        if not extra_pnginfo:
+            print("Error: extra_pnginfo is empty")
+        elif (not isinstance(extra_pnginfo[0], dict) or "workflow" not in extra_pnginfo[0]):
+            print("Error: extra_pnginfo[0] is not a dict or missing 'workflow' key")
+        else:
+            workflow = extra_pnginfo[0]["workflow"]
+            node = next((x for x in workflow["nodes"] if str(x["id"]) == unique_id[0]), None)
+            if node:
+                node["widgets_values"] = [values]
+        if isinstance(values, list) and len(values) == 1:
+            return {"ui": {"text": values}, "result": (values[0],), }
+        else:
+            return {"ui": {"text": values}, "result": (values,), }
 
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
@@ -376,6 +586,8 @@ NODE_CLASS_MAPPINGS = {
     "SmartRemoveComments": SmartRemoveComments,
     "SmartLoadLoRA": SmartLoadLoRA,
     "SmartPrompt": SmartPrompt,
+    "SmartModelOrLoraToString": SmartModelOrLoraToString,
+    "SmartShowAnything": SmartShowAnything,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -387,4 +599,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartRemoveComments": "Smart Remove Comments",
     "SmartLoadLoRA": "Smart Load LoRA",
     "SmartPrompt": "Smart Prompt",
+    "SmartModelOrLoraToString": "Smart Model or Lora to String",
+    "SmartShowAnything": "Smart Show Anything",
 }
