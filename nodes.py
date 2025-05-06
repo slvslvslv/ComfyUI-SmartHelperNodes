@@ -4,6 +4,9 @@ import comfy
 import comfy.sd # Added import for CLIP type access
 import json
 import sys
+import re # Added for regex operations
+import random # Added for random choice
+import time # Added for IS_CHANGED
 
 # Custom Nodes for ComfyUI
 # Note: All nodes in this file should use the "Smart" prefix in their names
@@ -439,14 +442,15 @@ class SmartLoadLoRA:
 
 class SmartPrompt:
     """
-    A node that provides a multiline text input, removes comments, and optionally encodes it using a CLIP model.
+    A node that provides a multiline text input, removes comments, supports random selection syntax { A | B | C }, 
+    and optionally encodes it using a CLIP model.
     """
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "text": ("STRING", {"multiline": True, "default": "", "tooltip": "Enter your prompt text. Lines with // comments will be cleaned up."}),
+                "text": ("STRING", {"multiline": True, "default": "", "tooltip": "Enter your prompt text. Lines with // comments will be cleaned up. Use { A | B | C } for random selection."}),
             },
             "optional": {
                 "clip": ("CLIP", {"tooltip": "Optional CLIP model for encoding the text."})
@@ -458,30 +462,83 @@ class SmartPrompt:
     FUNCTION = "process_prompt"
     CATEGORY = "SmartHelperNodes"
 
+    @staticmethod
+    def parse_random_syntax(text):
+        """Parses the { A | B | C } syntax and selects a random element."""
+        def replace_match(match):
+            # Extract content inside braces and split by '|'
+            options = [opt.strip() for opt in match.group(1).split('|')]
+            # Return a randomly chosen option
+            return random.choice(options)
+
+        # Regex to find { content } where content contains at least one |
+        # Example: {cat|dog|bird}
+        pattern = r'\{([^}]+?\|[^}]+?)\}'
+        
+        # Repeatedly apply substitution until no more matches are found
+        # This handles multiple occurrences, e.g., "{a|b} and {c|d}"
+        processed_text = text
+        # Limit iterations to prevent potential infinite loops with malformed input, though unlikely with this pattern
+        iterations = 0
+        max_iterations = 100 # Safety limit
+        while re.search(pattern, processed_text) and iterations < max_iterations:
+             # Replace one occurrence at a time
+             processed_text = re.sub(pattern, replace_match, processed_text, count=1) 
+             iterations += 1
+             
+        if iterations >= max_iterations:
+             print(f"Warning: Max iterations reached during random syntax processing in SmartPrompt. Input text: {text}")
+
+        return processed_text
+
     def process_prompt(self, text, clip=None):
-        # Split text into lines, remove comment portions, and rejoin
+        # 1. Remove comments
         lines = text.splitlines()
         processed_lines = []
         for line in lines:
-            # Find the position of // if it exists
             comment_pos = line.find('//')
             if comment_pos != -1:
-                # Keep only the part before the comment
                 line = line[:comment_pos].rstrip()
-            # Only add non-empty lines after comment removal
+            # Keep lines that are not empty after comment removal
             if line.strip():
                 processed_lines.append(line)
         
-        processed_text = "\n".join(processed_lines)
+        comment_cleaned_text = "\n".join(processed_lines)
         
+        # 2. Process random syntax { A | B | C }
+        processed_text = self.parse_random_syntax(comment_cleaned_text)
+        
+        # 3. Encode if CLIP is provided
         conditioning = None
         if clip is not None:
-            # Based on CLIPTextEncode example
             tokens = clip.tokenize(processed_text)
-            conditioning = clip.encode_from_tokens_scheduled(tokens)
-            
+            # Use encode_from_tokens_scheduled if available, otherwise fall back to encode
+            if hasattr(clip, 'encode_from_tokens_scheduled'):
+                 conditioning = clip.encode_from_tokens_scheduled(tokens)
+            elif hasattr(clip, 'encode'):
+                 # Standard CLIPTextEncode uses encode
+                 conditioning, _ = clip.encode_token_weights(tokens) # Assuming encode returns pooled_output as second value
+            else:
+                 print(f"Warning: Provided CLIP object for SmartPrompt node is missing a recognized encoding method (encode or encode_from_tokens_scheduled).")
+                 # Return empty conditioning or handle appropriately
+                 # For now, returning None which might cause downstream issues if conditioning is expected.
+                 # A more robust solution might involve returning a default "empty" conditioning object if possible.
+
         return (processed_text, conditioning)
-    
+
+    @classmethod
+    def IS_CHANGED(cls, text, clip=None, **kwargs):
+        # Check if the random syntax { A | B } is present in the input text
+        pattern = r'\{([^}]+?\|[^}]+?)\}'
+        # Use time.time() to force re-execution if the random syntax is detected
+        # Otherwise, rely on the hash of the text for standard change detection.
+        if re.search(pattern, text):
+            return time.time() 
+        # Hash the input text to detect changes. Add clip object's potential changes if needed.
+        # Note: Hashing the clip object itself might be complex/unreliable. 
+        # Relying on text changes is standard for prompt nodes.
+        return hash(text)
+
 class SmartModelOrLoraToString:
     @classmethod
     def INPUT_TYPES(s):

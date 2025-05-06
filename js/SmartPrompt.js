@@ -46,16 +46,20 @@ function colorizeText(style, text) {
 function styleDefaultText(text) {
     const defaultTextStyle = "color: rgb(200, 200, 200);"; // Your default grey
     const punctuationStyle = "color: black;";          // Style for punctuation
+    const pipeStyle = "color: red;";                   // Style for vertical line / braces
     let resultHtml = '';
     // Iterate character by character
     for (let i = 0; i < text.length; i++) {
         const char = text[i];
-        if (['.', ',', '(', ')', ';', ':'].includes(char)) {
+        if (['.', ',', '(', ')', ';', ':'].includes(char)) { // Removed { and }
              resultHtml += colorizeText(punctuationStyle, char);
+        } else if (['|', '{', '}'].includes(char)) { // Added { and }
+             resultHtml += colorizeText(pipeStyle, char);
         } else {
             // Optimization: Group consecutive non-punctuation characters
             let nonPunctSubstring = char;
-            while (i + 1 < text.length && !['.', ',', '(', ')', ';', ':'].includes(text[i + 1])) {
+            // Keep the while loop condition as is, it correctly handles braces and pipe
+            while (i + 1 < text.length && !['.', ',', '(', ')', ';', ':', '{', '}', '|'].includes(text[i + 1])) {
                 i++;
                 nonPunctSubstring += text[i];
             }
