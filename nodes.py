@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import folder_paths
 import comfy
@@ -7,6 +9,10 @@ import sys
 import re # Added for regex operations
 import random # Added for random choice
 import time # Added for IS_CHANGED
+import platform
+from inspect import cleandoc
+from typing import Any, Dict
+from server import PromptServer
 
 # Custom Nodes for ComfyUI
 # Note: All nodes in this file should use the "Smart" prefix in their names
@@ -355,6 +361,240 @@ class SmartSaveText:
             
         return (text,)
 
+class SmartSaveAnimatedGIF:
+    """
+    A node that saves a series of images as an animated GIF file with specified FPS.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Series of images to save as animated GIF"}),
+                "filename": ("STRING", {"default": "animation.gif", "tooltip": "Output filename for the GIF"}),
+                "fps": ("FLOAT", {"default": 10.0, "min": 0.1, "max": 60.0, "step": 0.1, "tooltip": "Frames per second for the animation"}),
+                "loop": ("INT", {"default": 0, "min": 0, "max": 65535, "tooltip": "Number of loops (0 = infinite loop)"}),
+                "optimize": ("BOOLEAN", {"default": True, "tooltip": "Optimize the GIF file size"}),
+                "quality": ("INT", {"default": 95, "min": 1, "max": 100, "tooltip": "Quality of the GIF (higher = better quality, larger file)"}),
+                "preserve_transparency": ("BOOLEAN", {"default": True, "tooltip": "Preserve alpha channel as GIF transparency (binary)"}),
+                "alpha_threshold": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Alpha values below this are transparent (0 = only fully transparent, 1 = all transparent)"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("file_path",)
+    FUNCTION = "save_animated_gif"
+    CATEGORY = "SmartHelperNodes"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Save a series of images as an animated GIF with customizable FPS, loop count, quality settings, and transparency preservation"
+
+    def save_animated_gif(self, images, filename, fps, loop, optimize, quality, preserve_transparency, alpha_threshold):
+        try:
+            from PIL import Image
+            import numpy as np
+            import torch
+        except ImportError as e:
+            raise RuntimeError(f"Required libraries not available: {e}. Please install Pillow.")
+
+        # Ensure filename has .gif extension
+        if not filename.lower().endswith('.gif'):
+            if filename.endswith('.'):
+                filename = filename + 'gif'
+            else:
+                filename = filename + '.gif'
+
+        # Convert relative path to absolute path within ComfyUI's output directory
+        output_dir = folder_paths.get_output_directory()
+        full_path = os.path.join(output_dir, filename)
+        
+        # Create directories if they don't exist
+        directory = os.path.dirname(full_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        
+        # Convert images to PIL format
+        pil_frames = []
+        has_transparent_pixel = False
+        used_colors = set()
+        alpha_thresh = alpha_threshold * 255
+
+        if isinstance(images, torch.Tensor) and images.dim() == 4:
+            # Handle batch of images
+            batch_size = images.shape[0]
+        else:
+            # If not a batch tensor, treat as list
+            batch_size = len(images)
+
+        for i in range(batch_size):
+            if isinstance(images, torch.Tensor):
+                img = images[i]
+            else:
+                img = images[i]
+
+            if isinstance(img, torch.Tensor):
+                img = img.detach().cpu()
+                if img.dim() == 3:
+                    if img.shape[0] in [1, 3, 4]:  # CHW
+                        img = img.permute(1, 2, 0)
+                if img.max() <= 1.0:
+                    img = img * 255
+                img = img.round().clamp(0, 255).byte().numpy()
+                mode = 'RGBA' if img.shape[-1] == 4 else 'RGB' if img.shape[-1] == 3 else 'L' if img.shape[-1] == 1 else None
+                if mode is None:
+                    raise ValueError(f"Unsupported tensor channel count: {img.shape[-1]}")
+                if mode == 'L':
+                    img = np.repeat(img[:, :, np.newaxis], 3, axis=-1)
+                    mode = 'RGB'
+                pil_img = Image.fromarray(img, mode)
+            elif isinstance(img, np.ndarray):
+                if img.max() <= 1.0:
+                    img = img * 255
+                img = np.round(img).clip(0, 255).astype(np.uint8)
+                mode = 'RGBA' if img.shape[-1] == 4 else 'RGB' if img.shape[-1] == 3 else 'L' if img.shape[-1] == 1 else None
+                if mode is None:
+                    raise ValueError(f"Unsupported array channel count: {img.shape[-1]}")
+                if mode == 'L':
+                    img = np.repeat(img[:, :, np.newaxis], 3, axis=-1)
+                    mode = 'RGB'
+                pil_img = Image.fromarray(img, mode)
+            elif isinstance(img, Image.Image):
+                pil_img = img
+            else:
+                raise ValueError(f"Unsupported image type: {type(img)}")
+
+            # Convert to RGBA for consistency if transparency might be present
+            if pil_img.mode not in ['RGB', 'RGBA']:
+                pil_img = pil_img.convert('RGB')
+
+            if preserve_transparency and pil_img.mode == 'RGBA':
+                data = np.array(pil_img)
+                alpha = data[:, :, 3]
+                if np.any(alpha < alpha_thresh):
+                    has_transparent_pixel = True
+                opaque_mask = alpha >= alpha_thresh
+                opaque_rgb = data[opaque_mask, :3]
+                for color in opaque_rgb:
+                    used_colors.add(tuple(map(int, color)))
+
+            pil_frames.append(pil_img)
+
+        if not pil_frames:
+            raise ValueError("No valid images provided")
+
+        if not preserve_transparency or not has_transparent_pixel:
+            # Composite to RGB with white background
+            for i in range(len(pil_frames)):
+                if pil_frames[i].mode == 'RGBA':
+                    background = Image.new('RGB', pil_frames[i].size, (255, 255, 255))
+                    background.paste(pil_frames[i], mask=pil_frames[i].getchannel('A'))
+                    pil_frames[i] = background
+            pil_images = pil_frames
+        else:
+            # Find global key_color not used in any opaque pixel
+            key_color = None
+            attempts = 0
+            while attempts < 10000 and key_color is None:
+                r = random.randint(0, 255)
+                g = random.randint(0, 255)
+                b = random.randint(0, 255)
+                if (r, g, b) not in used_colors:
+                    key_color = (r, g, b)
+                attempts += 1
+
+            if key_color is None:
+                key_color = (255, 0, 255)
+                # Replace occurrences of key_color in opaque areas
+                for i in range(len(pil_frames)):
+                    if pil_frames[i].mode == 'RGBA':
+                        data = np.array(pil_frames[i])
+                        alpha = data[:, :, 3]
+                        match = (data[:, :, 0] == 255) & (data[:, :, 1] == 0) & (data[:, :, 2] == 255) & (alpha >= alpha_thresh)
+                        data[match, 0] = 254
+                        pil_frames[i] = Image.fromarray(data, 'RGBA')
+
+            # Create RGB frames with key_color in transparent areas
+            rgb_frames = []
+            for frame in pil_frames:
+                if frame.mode == 'RGBA':
+                    data = np.array(frame)
+                    transparent_mask = data[:, :, 3] < alpha_thresh
+                    rgb_data = data[:, :, :3]
+                    rgb_data[transparent_mask] = key_color
+                    frame_rgb = Image.fromarray(rgb_data, 'RGB')
+                else:
+                    frame_rgb = frame.convert('RGB')
+                rgb_frames.append(frame_rgb)
+
+            # Create large image for global palette
+            widths, heights = zip(*(f.size for f in rgb_frames))
+            max_width = max(widths)
+            total_height = sum(heights) + 32  # Extra for key block
+            large_img = Image.new('RGB', (max_width, total_height))
+            y = 0
+            for f in rgb_frames:
+                large_img.paste(f, (0, y))
+                y += f.height
+            key_block = Image.new('RGB', (32, 32), key_color)
+            large_img.paste(key_block, (0, y))
+
+            # Quantize large image
+            large_quant = large_img.quantize(colors=256, method=Image.Quantize.MAXCOVERAGE)
+            global_palette = large_quant.getpalette()[:256*3]
+
+            # Find trans_index
+            trans_index = -1
+            for i in range(256):
+                if (global_palette[i*3] == key_color[0] and
+                    global_palette[i*3 + 1] == key_color[1] and
+                    global_palette[i*3 + 2] == key_color[2]):
+                    trans_index = i
+                    break
+
+            if trans_index == -1:
+                # Fallback to per-frame palettes
+                pil_images = []
+                for frame_rgb in rgb_frames:
+                    frame_p = frame_rgb.quantize(colors=256)
+                    palette = frame_p.getpalette()[:256*3]
+                    for j in range(256):
+                        if (palette[j*3] == key_color[0] and
+                            palette[j*3 + 1] == key_color[1] and
+                            palette[j*3 + 2] == key_color[2]):
+                            frame_p.info['transparency'] = j
+                            frame_p.info['disposal'] = 2
+                            break
+                        pil_images.append(frame_p)
+                    if pil_images:
+                        pil_images[0].info['background'] = pil_images[0].info.get('transparency', 0)
+            else:
+                # Use global palette
+                palette_img = Image.new('P', (1, 1))
+                palette_img.putpalette(global_palette)
+                pil_images = []
+                for frame_rgb in rgb_frames:
+                    frame_p = frame_rgb.quantize(palette=palette_img)
+                    frame_p.info['transparency'] = trans_index
+                    frame_p.info['disposal'] = 2
+                    pil_images.append(frame_p)
+                if pil_images:
+                    pil_images[0].info['background'] = trans_index
+
+        # Calculate duration per frame in milliseconds
+        duration = int(1000 / fps)
+        
+        # Save as animated GIF
+        pil_images[0].save(
+            full_path,
+            save_all=True,
+            append_images=pil_images[1:],
+            duration=duration,
+            loop=loop,
+            optimize=optimize,
+            quality=quality
+        )
+        
+        return (full_path,)
+
 class SmartRemoveComments:
     """
     A node that removes all comments starting with // anywhere in the line
@@ -529,13 +769,22 @@ class SmartPrompt:
     @classmethod
     def IS_CHANGED(cls, text, clip=None, **kwargs):
         # Check if the random syntax { A | B } is present in the input text
+        # but ignore patterns that have a comment // before the opening { on the same line
+        lines = text.splitlines()
         pattern = r'\{([^}]+?\|[^}]+?)\}'
-        # Use time.time() to force re-execution if the random syntax is detected
-        # Otherwise, rely on the hash of the text for standard change detection.
-        if re.search(pattern, text):
-            return time.time() 
+
+        for line in lines:
+            # Skip lines that have // before any { on that line
+            comment_pos = line.find('//')
+            brace_pos = line.find('{')
+
+            # If there's a { and either no // or the // comes after the {
+            if brace_pos != -1 and (comment_pos == -1 or comment_pos > brace_pos):
+                if re.search(pattern, line):
+                    return time.time()
+
         # Hash the input text to detect changes. Add clip object's potential changes if needed.
-        # Note: Hashing the clip object itself might be complex/unreliable. 
+        # Note: Hashing the clip object itself might be complex/unreliable.
         # Relying on text changes is standard for prompt nodes.
         return hash(text)
 
@@ -634,17 +883,343 @@ class SmartShowAnything:
         else:
             return {"ui": {"text": values}, "result": (values,), }
 
+class SmartHWMonitor:
+    """
+    A node that monitors hardware metrics including CPU/GPU temperature and RAM usage.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "refresh_rate": ("INT", {"default": 1, "min": 1, "max": 60, "step": 1, "tooltip": "Refresh rate in seconds for hardware monitoring"}),
+                "include_cpu_temp": ("BOOLEAN", {"default": True, "tooltip": "Include CPU temperature in output"}),
+                "include_gpu_temp": ("BOOLEAN", {"default": True, "tooltip": "Include GPU temperature in output"}),
+                "include_ram": ("BOOLEAN", {"default": True, "tooltip": "Include RAM usage in output"}),
+                "include_cpu_usage": ("BOOLEAN", {"default": True, "tooltip": "Include CPU usage percentage in output"}),
+                "include_vram": ("BOOLEAN", {"default": True, "tooltip": "Include VRAM usage in output"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("hw_info",)
+    FUNCTION = "get_hardware_info"
+    CATEGORY = "SmartHelperNodes"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Monitor hardware metrics including CPU/GPU temperature and RAM usage"
+
+    def get_hardware_info(self, refresh_rate, include_cpu_temp, include_gpu_temp, include_ram, include_cpu_usage, include_vram):
+        hw_info_lines = []
+        hw_info_lines.append(f"=== Hardware Monitor ({time.strftime('%H:%M:%S')}) ===")
+        
+        # CPU Usage
+        if include_cpu_usage:
+            try:
+                import psutil
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                hw_info_lines.append(f"CPU Usage: {cpu_percent:.1f}%")
+            except ImportError:
+                hw_info_lines.append("CPU Usage: psutil not available")
+            except Exception as e:
+                hw_info_lines.append(f"CPU Usage: Error - {str(e)}")
+
+        # CPU Temperature
+        if include_cpu_temp:
+            try:
+                import psutil
+                cpu_temp = None
+                
+                # Method 1: Try psutil sensors (Linux/some Windows)
+                if hasattr(psutil, 'sensors_temperatures'):
+                    temps = psutil.sensors_temperatures()
+                    # Try different sensor names for CPU temperature
+                    for sensor_name in ['coretemp', 'cpu_thermal', 'k10temp', 'acpi']:
+                        if sensor_name in temps and temps[sensor_name]:
+                            cpu_temp = temps[sensor_name][0].current
+                            break
+                
+                # Method 2: Try Windows WMI Win32_TemperatureProbe
+                if cpu_temp is None and platform.system() == "Windows":
+                    try:
+                        import subprocess
+                        result = subprocess.run([
+                            'wmic', 'path', 'Win32_TemperatureProbe', 'get', 'CurrentReading', '/format:value'
+                        ], capture_output=True, text=True, timeout=10)
+                        if result.returncode == 0:
+                            for line in result.stdout.split('\n'):
+                                if 'CurrentReading=' in line:
+                                    temp_value = line.split('=')[1].strip()
+                                    if temp_value.isdigit():
+                                        # Win32_TemperatureProbe returns tenths of Kelvin
+                                        temp_celsius = (int(temp_value) / 10.0) - 273.15
+                                        # Only accept reasonable temperature values
+                                        if 0 <= temp_celsius <= 120:
+                                            cpu_temp = temp_celsius
+                                            break
+                    except Exception:
+                        pass
+                
+                # Method 3: Try Windows WMI MSAcpi_ThermalZoneTemperature
+                if cpu_temp is None and platform.system() == "Windows":
+                    try:
+                        import subprocess
+                        result = subprocess.run([
+                            'wmic', '/namespace:\\\\root\\wmi', 'path', 'MSAcpi_ThermalZoneTemperature', 
+                            'get', 'CurrentTemperature', '/format:value'
+                        ], capture_output=True, text=True, timeout=10)
+                        if result.returncode == 0:
+                            for line in result.stdout.split('\n'):
+                                if 'CurrentTemperature=' in line:
+                                    temp_value = line.split('=')[1].strip()
+                                    if temp_value.isdigit():
+                                        # Convert from tenths of Kelvin to Celsius
+                                        temp_celsius = (int(temp_value) / 10.0) - 273.15
+                                        # Only accept reasonable temperature values
+                                        if 0 <= temp_celsius <= 120:
+                                            cpu_temp = temp_celsius
+                                            break
+                    except Exception:
+                        pass
+                
+                # Method 4: Try Windows Performance Counters
+                if cpu_temp is None and platform.system() == "Windows":
+                    try:
+                        import subprocess
+                        result = subprocess.run([
+                            'typeperf', '\\Thermal Zone Information(*)\\Temperature', '-sc', '1'
+                        ], capture_output=True, text=True, timeout=10)
+                        if result.returncode == 0:
+                            lines = result.stdout.split('\n')
+                            for line in lines:
+                                if 'Temperature' in line and ',' in line:
+                                    parts = line.split(',')
+                                    if len(parts) >= 2:
+                                        temp_str = parts[-1].strip().replace('"', '')
+                                        try:
+                                            temp_value = float(temp_str)
+                                            temp_celsius = temp_value - 273.15  # Convert Kelvin to Celsius
+                                            # Only accept reasonable temperature values
+                                            if 0 <= temp_celsius <= 120:
+                                                cpu_temp = temp_celsius
+                                                break
+                                        except ValueError:
+                                            continue
+                    except Exception:
+                        pass
+                
+                # Method 5: Try reading thermal zones on Linux
+                if cpu_temp is None and platform.system() == "Linux":
+                    try:
+                        with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                            temp_millicelsius = int(f.read().strip())
+                            cpu_temp = temp_millicelsius / 1000.0
+                    except (FileNotFoundError, ValueError, PermissionError):
+                        pass
+                
+                # Method 6: Try alternative thermal zones on Linux
+                if cpu_temp is None and platform.system() == "Linux":
+                    try:
+                        import glob
+                        thermal_zones = glob.glob('/sys/class/thermal/thermal_zone*/temp')
+                        for zone_file in thermal_zones:
+                            try:
+                                with open(zone_file, 'r') as f:
+                                    temp_millicelsius = int(f.read().strip())
+                                    potential_temp = temp_millicelsius / 1000.0
+                                    # Filter reasonable CPU temperatures (0-120°C)
+                                    if 0 <= potential_temp <= 120:
+                                        cpu_temp = potential_temp
+                                        break
+                            except (ValueError, PermissionError):
+                                continue
+                    except Exception:
+                        pass
+                
+                # Method 7: Try Windows PowerShell WMI query
+                if cpu_temp is None and platform.system() == "Windows":
+                    try:
+                        import subprocess
+                        result = subprocess.run([
+                            'powershell', '-Command', 
+                            'Get-WmiObject -Namespace "root\\wmi" -Class MSAcpi_ThermalZoneTemperature | Select-Object CurrentTemperature'
+                        ], capture_output=True, text=True, timeout=15)
+                        if result.returncode == 0:
+                            for line in result.stdout.split('\n'):
+                                line = line.strip()
+                                if line.isdigit():
+                                    temp_celsius = (int(line) / 10.0) - 273.15
+                                    # Only accept reasonable temperature values
+                                    if 0 <= temp_celsius <= 120:
+                                        cpu_temp = temp_celsius
+                                        break
+                    except Exception:
+                        pass
+                
+                # Only show temperature if we found a real sensor reading
+                if cpu_temp is not None:
+                    hw_info_lines.append(f"CPU Temperature: {cpu_temp:.1f}°C")
+                else:
+                    # Provide helpful instructions based on platform
+                    if platform.system() == "Windows":
+                        hw_info_lines.append("CPU Temperature: Not available")
+                        hw_info_lines.append("To enable CPU temperature monitoring:")
+                        hw_info_lines.append("• Install OpenHardwareMonitor (ohm.openhardwaremonitor.org)")
+                        hw_info_lines.append("• OR install HWiNFO64 with shared memory enabled")
+                        hw_info_lines.append("• OR run ComfyUI as Administrator")
+                        hw_info_lines.append("• OR install motherboard-specific monitoring software")
+                    elif platform.system() == "Linux":
+                        hw_info_lines.append("CPU Temperature: Not available")
+                        hw_info_lines.append("To enable CPU temperature monitoring:")
+                        hw_info_lines.append("• Install lm-sensors: sudo apt install lm-sensors")
+                        hw_info_lines.append("• Run: sudo sensors-detect")
+                        hw_info_lines.append("• Load sensor modules: sudo modprobe coretemp")
+                        hw_info_lines.append("• Install psutil: pip install psutil")
+                    elif platform.system() == "Darwin":
+                        hw_info_lines.append("CPU Temperature: Not available")
+                        hw_info_lines.append("To enable CPU temperature monitoring:")
+                        hw_info_lines.append("• Install TG Pro or Macs Fan Control")
+                        hw_info_lines.append("• OR install iStat Menus")
+                        hw_info_lines.append("• macOS restricts direct sensor access")
+                    else:
+                        hw_info_lines.append("CPU Temperature: Not available on this platform")
+                # If no real temperature found, don't show anything (no estimates)
+                        
+            except ImportError:
+                # Don't show error message, just skip temperature
+                pass
+            except Exception as e:
+                # Don't show error message, just skip temperature
+                pass
+
+        # GPU Temperature
+        if include_gpu_temp:
+            gpu_temp_found = False
+            
+            # Try NVIDIA GPU first
+            try:
+                import subprocess
+                result = subprocess.run(['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader,nounits'], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    temps = result.stdout.strip().split('\n')
+                    for i, temp in enumerate(temps):
+                        if temp.strip():
+                            hw_info_lines.append(f"GPU {i} Temperature: {temp.strip()}°C")
+                            gpu_temp_found = True
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+                pass
+            except Exception as e:
+                pass
+            
+            # Try AMD GPU if NVIDIA not found
+            if not gpu_temp_found:
+                try:
+                    import psutil
+                    if hasattr(psutil, 'sensors_temperatures'):
+                        temps = psutil.sensors_temperatures()
+                        for sensor_name in ['amdgpu', 'radeon']:
+                            if sensor_name in temps and temps[sensor_name]:
+                                for sensor in temps[sensor_name]:
+                                    if 'edge' in sensor.label.lower() or 'junction' in sensor.label.lower():
+                                        hw_info_lines.append(f"GPU Temperature: {sensor.current:.1f}°C")
+                                        gpu_temp_found = True
+                                        break
+                                if gpu_temp_found:
+                                    break
+                except Exception:
+                    pass
+            
+            if not gpu_temp_found:
+                hw_info_lines.append("GPU Temperature: No compatible GPU found")
+
+        # RAM Usage
+        if include_ram:
+            try:
+                import psutil
+                memory = psutil.virtual_memory()
+                ram_used_gb = memory.used / (1024**3)
+                ram_total_gb = memory.total / (1024**3)
+                ram_percent = memory.percent
+                hw_info_lines.append(f"RAM Usage: {ram_used_gb:.1f}GB / {ram_total_gb:.1f}GB ({ram_percent:.1f}%)")
+            except ImportError:
+                hw_info_lines.append("RAM Usage: psutil not available")
+            except Exception as e:
+                hw_info_lines.append(f"RAM Usage: Error - {str(e)}")
+        
+        # System info
+        hw_info_lines.append(f"System: {platform.system()} {platform.release()}")
+        
+        # VRAM Usage
+        if include_vram:
+            vram_found = False
+            
+            # Try NVIDIA GPU VRAM
+            try:
+                import subprocess
+                result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    for i, line in enumerate(lines):
+                        if line.strip():
+                            parts = line.strip().split(', ')
+                            if len(parts) == 2:
+                                used_mb = int(parts[0])
+                                total_mb = int(parts[1])
+                                used_gb = used_mb / 1024
+                                total_gb = total_mb / 1024
+                                percent = (used_mb / total_mb) * 100
+                                hw_info_lines.append(f"GPU {i} VRAM: {used_gb:.1f}GB / {total_gb:.1f}GB ({percent:.1f}%)")
+                                vram_found = True
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+                pass
+            except Exception:
+                pass
+            
+            # Try AMD GPU VRAM (if available)
+            if not vram_found:
+                try:
+                    # Try reading from /sys filesystem on Linux for AMD
+                    if platform.system() == "Linux":
+                        import glob
+                        amd_cards = glob.glob('/sys/class/drm/card*/device/mem_info_vram_*')
+                        for card_path in amd_cards:
+                            try:
+                                with open(card_path, 'r') as f:
+                                    vram_info = f.read().strip()
+                                    # Parse AMD VRAM info if format is known
+                                    hw_info_lines.append(f"AMD VRAM: {vram_info}")
+                                    vram_found = True
+                                    break
+                            except:
+                                continue
+                except Exception:
+                    pass
+            
+            if not vram_found:
+                hw_info_lines.append("VRAM: No compatible GPU found")
+
+        return ("\n".join(hw_info_lines),)
+
+    @classmethod
+    def IS_CHANGED(cls, refresh_rate, include_cpu_temp, include_gpu_temp, include_ram, include_cpu_usage, include_vram):
+        # Force refresh based on refresh_rate
+        import time
+        return int(time.time() / refresh_rate)
+
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
     "SmartHVLoraStack": SmartHVLoraStack,
     "SmartFormatString": SmartFormatString,
     "SmartFormatString10": SmartFormatString10,
     "SmartSaveText": SmartSaveText,
+    "SmartSaveAnimatedGIF": SmartSaveAnimatedGIF,
     "SmartRemoveComments": SmartRemoveComments,
     "SmartLoadLoRA": SmartLoadLoRA,
     "SmartPrompt": SmartPrompt,
     "SmartModelOrLoraToString": SmartModelOrLoraToString,
     "SmartShowAnything": SmartShowAnything,
+    "SmartHWMonitor": SmartHWMonitor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -653,9 +1228,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartFormatString": "Smart Format String",
     "SmartFormatString10": "Smart Format String (10 params)",
     "SmartSaveText": "Smart Save Text File",
+    "SmartSaveAnimatedGIF": "Smart Save Animated GIF",
     "SmartRemoveComments": "Smart Remove Comments",
     "SmartLoadLoRA": "Smart Load LoRA",
     "SmartPrompt": "Smart Prompt",
     "SmartModelOrLoraToString": "Smart Model or Lora to String",
     "SmartShowAnything": "Smart Show Anything",
+    "SmartHWMonitor": "Smart Hardware Monitor",
 }

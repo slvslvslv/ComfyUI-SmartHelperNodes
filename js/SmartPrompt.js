@@ -248,14 +248,22 @@ app.registerExtension({
                 onNodeCreated?.apply(this, arguments);
                 const widget = this.widgets.find(w => w.name === "text");
                 if (widget && widget.inputEl) {
-                    // Use timeout to ensure element is fully in DOM before enhancing
-                    setTimeout(() => {
-                         if (document.contains(widget.inputEl)) { // Final check
+                    // Use a polling mechanism with requestAnimationFrame to wait for the textarea to be in the DOM.
+                    // This is more reliable than a fixed timeout, especially on slow systems or complex workflows.
+                    let attempts = 0;
+                    const maxAttempts = 100; // Roughly 1.6 seconds
+
+                    const tryEnhance = () => {
+                        if (document.contains(widget.inputEl)) {
                             enhanceSmartPromptTextarea(widget.inputEl);
-                         } else {
-                             console.error("SmartPrompt: Textarea not in DOM for enhancement.");
-                         }
-                    }, 0);
+                        } else if (attempts < maxAttempts) {
+                            attempts++;
+                            requestAnimationFrame(tryEnhance);
+                        } else {
+                            console.error("SmartPrompt: Textarea not in DOM for enhancement after " + maxAttempts + " attempts.");
+                        }
+                    };
+                    tryEnhance();
                 }
             };
         } else {
