@@ -123,6 +123,7 @@ function syncSmartPromptText(textarea, overlay) {
 // Function to set overlay style based on textarea
 function setOverlayStyle(inputEl, overlayEl) {
     const textareaStyle = window.getComputedStyle(inputEl);
+
     // Base styles for the overlay
     overlayEl.style.cssText = `
         position: absolute;
@@ -147,6 +148,13 @@ function setOverlayStyle(inputEl, overlayEl) {
         background-color: var(--comfy-input-bg); /* Explicitly use the input background variable */
         z-index: 1; /* Ensure overlay is above textarea background */
     `;
+
+    // Adjust padding for scrollbar to prevent text overlap
+    const scrollbarWidth = inputEl.offsetWidth - inputEl.clientWidth - parseFloat(textareaStyle.borderLeftWidth) - parseFloat(textareaStyle.borderRightWidth);
+    if (inputEl.scrollHeight > inputEl.clientHeight && scrollbarWidth > 0) {
+        overlayEl.style.paddingRight = `${parseFloat(textareaStyle.paddingRight) + scrollbarWidth}px`;
+    }
+
     // --- Make underlying textarea text semi-transparent ---
     inputEl.style.opacity = '0.4'; // Adjust value (0.0 to 1.0) as needed
 
