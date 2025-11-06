@@ -300,8 +300,8 @@ class SmartFormatString:
         for placeholder, value in time_placeholders.items():
             result = result.replace(placeholder, value)
         
-        # Process numbered parameters as before
-        for i in range(1, self.max_param_num + 1):
+        # Process numbered parameters in reverse order to handle double-digit numbers correctly
+        for i in range(self.max_param_num, 0, -1):
             param_value = kwargs.get(f"param_{i}", "")
             str_value = str(param_value) if param_value is not None else ""
             result = result.replace(f"%{i}", str_value)
