@@ -74,7 +74,7 @@ function syncSmartPromptText(textarea, overlay) {
     const lines = textarea.value.split('\n');
     let htmlContent = '';
     // Main regex for comments and colon-floats
-    const highlightRegex = /(\/\/.*)|:(\s*\d+\.\d*|:?\s*\.?\d*)/g;
+    const highlightRegex = /(\/\/.*)|:(\s*\d+(?:\.\d*)?|\s*\.\d+)/g;
     // Define styles
     const defaultTextStyle = "color: rgb(200, 200, 200);";
     const commentStyle = "color: rgb(0, 0, 255);";
