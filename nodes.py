@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import importlib
+import importlib.util
+import torch
 import folder_paths
 import comfy
 import comfy.sd # Added import for CLIP type access
@@ -13,6 +16,7 @@ import platform
 from inspect import cleandoc
 from typing import Any, Dict
 from server import PromptServer
+from comfy_execution.graph_utils import is_link
 
 # Custom Nodes for ComfyUI
 # Note: All nodes in this file should use the "Smart" prefix in their names
@@ -319,6 +323,183 @@ class SmartFormatString:
 class SmartFormatString10(SmartFormatString):
     max_param_num = 10  # Override with 10 parameters
 
+
+SMART_BUS_TYPE = "SMART_BUS"
+SMART_BUS_SLOT_LABELS = (
+    "any 1",
+    "any 2",
+    "any 3",
+    "any 4",
+    "any 5",
+    "any 6",
+    "any 7",
+    "any 8",
+    "any 9",
+    "any 10",
+)
+
+
+def _normalize_smart_bus(bus, size=10):
+    values = [None] * size
+    labels = list(SMART_BUS_SLOT_LABELS[:size])
+
+    if isinstance(bus, dict):
+        source_values = bus.get("values", [])
+        source_labels = bus.get("labels", [])
+    elif isinstance(bus, (list, tuple)):
+        source_values = bus
+        source_labels = []
+    else:
+        source_values = []
+        source_labels = []
+
+    for index, value in enumerate(source_values[:size]):
+        values[index] = value
+
+    for index, label in enumerate(source_labels[:size]):
+        if isinstance(label, str) and label.strip():
+            labels[index] = label.strip()
+
+    return {
+        "values": values,
+        "labels": labels,
+    }
+
+
+def _get_smart_bus_node(unique_id=None, extra_pnginfo=None):
+    if not unique_id or not extra_pnginfo:
+        return None
+
+    try:
+        info = extra_pnginfo[0] if isinstance(extra_pnginfo, (list, tuple)) else extra_pnginfo
+        workflow = info.get("workflow")
+        node_value = unique_id[0] if isinstance(unique_id, (list, tuple)) else unique_id
+        node_id = str(node_value)
+    except (IndexError, AttributeError, TypeError):
+        return None
+
+    if not workflow:
+        return None
+
+    return next((node for node in workflow.get("nodes", []) if str(node.get("id")) == node_id), None)
+
+
+def _get_smart_bus_labels(unique_id=None, extra_pnginfo=None, size=10):
+    labels = list(SMART_BUS_SLOT_LABELS[:size])
+    node = _get_smart_bus_node(unique_id, extra_pnginfo)
+    if not node:
+        return labels
+
+    properties = node.get("properties", {})
+    for index, default_label in enumerate(labels):
+        value = properties.get(default_label)
+        if isinstance(value, str) and value.strip():
+            labels[index] = value.strip()
+
+    return labels
+
+
+def _smart_bus_param_is_linked(prompt, unique_id, param_key):
+    """True if param_* has a wire in the prompt; False if absent/null (keep bus slot)."""
+    if prompt is None or unique_id is None:
+        return None
+    node_value = unique_id[0] if isinstance(unique_id, (list, tuple)) else unique_id
+    node_id = str(node_value)
+    node = prompt.get(node_id)
+    if not isinstance(node, dict):
+        return None
+    raw = (node.get("inputs") or {}).get(param_key)
+    if raw is None:
+        return False
+    return is_link(raw)
+
+
+class SmartBusIn:
+    max_param_num = 10
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = {
+            "required": {},
+            "optional": {
+                "bus": (SMART_BUS_TYPE,),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "prompt": "PROMPT",
+            },
+        }
+
+        for i in range(1, cls.max_param_num + 1):
+            inputs["optional"][f"param_{i}"] = (any_type,)
+
+        return inputs
+
+    RETURN_TYPES = (SMART_BUS_TYPE,)
+    RETURN_NAMES = ("bus",)
+    FUNCTION = "build_bus"
+    CATEGORY = "SmartHelperNodes/Bus"
+    DESCRIPTION = "Merge into a Smart Bus: only wired param slots replace values; unwired slots keep the incoming bus."
+
+    def build_bus(self, bus=None, unique_id=None, extra_pnginfo=None, prompt=None, **kwargs):
+        bus_data = _normalize_smart_bus(bus, self.max_param_num)
+        values = bus_data["values"]
+
+        for i in range(1, self.max_param_num + 1):
+            key = f"param_{i}"
+            linked = _smart_bus_param_is_linked(prompt, unique_id, key)
+            if linked is True:
+                if key in kwargs:
+                    values[i - 1] = kwargs[key]
+            elif linked is False:
+                pass
+            else:
+                if key in kwargs:
+                    values[i - 1] = kwargs[key]
+
+        labels = _get_smart_bus_labels(unique_id, extra_pnginfo, self.max_param_num)
+
+        return ({
+            "values": values,
+            "labels": labels,
+        },)
+
+
+class SmartBusOut:
+    max_param_num = 10
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "bus": (SMART_BUS_TYPE,),
+            }
+        }
+
+    RETURN_TYPES = (SMART_BUS_TYPE,) + (any_type,) * max_param_num
+    RETURN_NAMES = ("bus",) + SMART_BUS_SLOT_LABELS
+    FUNCTION = "expand_bus"
+    CATEGORY = "SmartHelperNodes/Bus"
+    DESCRIPTION = "Expand a Smart Bus back into its 10 stored passthrough values."
+
+    def expand_bus(self, bus):
+        bus_data = _normalize_smart_bus(bus, self.max_param_num)
+        values = bus_data["values"]
+        return (bus_data, *values)
+
+
+class SmartBusIn5(SmartBusIn):
+    max_param_num = 5
+    DESCRIPTION = "Merge into a Smart Bus: only wired param slots replace values; unwired slots keep the incoming bus."
+
+
+class SmartBusOut5(SmartBusOut):
+    max_param_num = 5
+    RETURN_TYPES = (SMART_BUS_TYPE,) + (any_type,) * max_param_num
+    RETURN_NAMES = ("bus",) + SMART_BUS_SLOT_LABELS[:max_param_num]
+    DESCRIPTION = "Expand a Smart Bus back into its 5 stored passthrough values."
+
 class SmartSaveText:
     """
     A node that saves text to a file, creating directories as needed and appending to existing files.
@@ -347,16 +528,18 @@ class SmartSaveText:
         directory = os.path.dirname(full_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-            
-        # Append to file (or create if doesn't exist)
-        with open(full_path, "a+", encoding="utf-8") as f:
-            # Add newline if file is not empty and doesn't end with one
-            if f.tell() != 0:
-                f.seek(0)
-                content = f.read()
-                if content and not content.endswith('\n'):
-                    f.write('\n')
-            # Write the new text
+        
+        # Check if we need a leading newline (file exists, non-empty, doesn't end with newline)
+        needs_newline = False
+        if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
+            with open(full_path, "rb") as f:
+                f.seek(-1, 2)  # Seek to last byte from end
+                needs_newline = f.read(1) != b'\n'
+        
+        # Append to file
+        with open(full_path, "a", encoding="utf-8") as f:
+            if needs_newline:
+                f.write('\n')
             f.write(text)
             
         return (text,)
@@ -642,19 +825,21 @@ class SmartLoadLoRA:
                 "strength_clip": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01, "tooltip": "How strongly to modify the CLIP model. This value can be negative."}),
             },
             "optional": {
+                "model2": ("MODEL", {"tooltip": "Optional second diffusion model; the same LoRA is applied to both models (UNet only on this input)."}),
                 "lora_string": ("STRING", {"forceInput": True, "default": ""})
             }
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP", "STRING")
-    RETURN_NAMES = ("model", "clip", "lora_string")
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "MODEL")
+    RETURN_NAMES = ("model", "clip", "lora_string", "model2")
     FUNCTION = "load_lora"
     CATEGORY = "SmartHelperNodes"
-    DESCRIPTION = "Load a LoRA model (just like the core LoRA loader), but also outputs the model name and strength to a formatted string."
+    DESCRIPTION = "Load a LoRA model (just like the core LoRA loader), but also outputs the model name and strength to a formatted string. Optional second model applies the same UNet LoRA."
 
-    def load_lora(self, model, clip, lora_name, strength_model, strength_clip, lora_string=""):
+    def load_lora(self, model, clip, lora_name, strength_model, strength_clip, model2=None, lora_string=""):
         if strength_model == 0 and strength_clip == 0:
-            return (model, clip, lora_string)
+            m2_out = model2 if model2 is not None else model
+            return (model, clip, lora_string, m2_out)
 
         lora_path = folder_paths.get_full_path("loras", lora_name)
         lora = None
@@ -669,7 +854,12 @@ class SmartLoadLoRA:
             self.loaded_lora = (lora_path, lora)
 
         model_lora, clip_lora = comfy.sd.load_lora_for_models(model, clip, lora, strength_model, strength_clip)
-        
+
+        if model2 is not None:
+            model2_lora, _ = comfy.sd.load_lora_for_models(model2, None, lora, strength_model, 0)
+        else:
+            model2_lora = model_lora
+
         # Create formatted string output
         lora_name_without_ext = lora_name.split(".")[0]
         new_lora_string = f"{lora_name_without_ext}, model_str:{strength_model}, clip_str:{strength_clip}"
@@ -677,8 +867,79 @@ class SmartLoadLoRA:
             final_lora_string = f"{lora_string}\n{new_lora_string}"
         else:
             final_lora_string = new_lora_string
-            
-        return (model_lora, clip_lora, final_lora_string)
+
+        return (model_lora, clip_lora, final_lora_string, model2_lora)
+
+
+class SmartLoadDoubleLoRA:
+    def __init__(self):
+        self.loaded_lora_1 = None
+        self.loaded_lora_2 = None
+
+    @classmethod
+    def INPUT_TYPES(s):
+        lora_list = folder_paths.get_filename_list("loras")
+        return {
+            "required": {
+                "model1": ("MODEL", {"tooltip": "First diffusion model."}),
+                "model2": ("MODEL", {"tooltip": "Second diffusion model."}),
+                "clip": ("CLIP", {"tooltip": "The CLIP model both LoRAs will be applied to."}),
+                "lora_name_1": (lora_list, {"tooltip": "LoRA applied to model1 and CLIP."}),
+                "strength_model_1": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+                "strength_clip_1": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+                "lora_name_2": (lora_list, {"tooltip": "LoRA applied to model2 and CLIP."}),
+                "strength_model_2": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+                "strength_clip_2": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+            },
+            "optional": {
+                "lora_string": ("STRING", {"forceInput": True, "default": ""})
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "MODEL", "CLIP", "STRING")
+    RETURN_NAMES = ("model1", "model2", "clip", "lora_string")
+    FUNCTION = "load_double_lora"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Apply two different LoRAs: lora1 to model1, lora2 to model2, and both to CLIP sequentially."
+
+    def _get_lora(self, cache_attr, lora_name):
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+        cached = getattr(self, cache_attr)
+        if cached is not None and cached[0] == lora_path:
+            return cached[1]
+        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        setattr(self, cache_attr, (lora_path, lora))
+        return lora
+
+    def load_double_lora(self, model1, model2, clip,
+                         lora_name_1, strength_model_1, strength_clip_1,
+                         lora_name_2, strength_model_2, strength_clip_2,
+                         lora_string=""):
+        # LoRA 1 → model1 + clip
+        if strength_model_1 == 0 and strength_clip_1 == 0:
+            m1_out, clip_out = model1, clip
+        else:
+            lora1 = self._get_lora("loaded_lora_1", lora_name_1)
+            m1_out, clip_out = comfy.sd.load_lora_for_models(model1, clip, lora1, strength_model_1, strength_clip_1)
+
+        # LoRA 2 → model2 + clip (already patched by lora1)
+        if strength_model_2 == 0 and strength_clip_2 == 0:
+            m2_out = model2
+        else:
+            lora2 = self._get_lora("loaded_lora_2", lora_name_2)
+            m2_out, clip_out = comfy.sd.load_lora_for_models(model2, clip_out, lora2, strength_model_2, strength_clip_2)
+
+        # Build lora_string
+        parts = []
+        if lora_string:
+            parts.append(lora_string)
+        n1 = lora_name_1.split(".")[0]
+        parts.append(f"{n1}, model_str:{strength_model_1}, clip_str:{strength_clip_1}")
+        n2 = lora_name_2.split(".")[0]
+        parts.append(f"{n2}, model_str:{strength_model_2}, clip_str:{strength_clip_2}")
+
+        return (m1_out, m2_out, clip_out, "\n".join(parts))
+
 
 class SmartPrompt:
     """
@@ -882,6 +1143,145 @@ class SmartShowAnything:
             return {"ui": {"text": values}, "result": (values[0],), }
         else:
             return {"ui": {"text": values}, "result": (values,), }
+
+class SmartSetInt:
+    """
+    A node that sets the output to a specific integer value.
+    When bypassed, it passes through the input value instead.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input": ("INT", {"default": 0, "tooltip": "Input value (used when node is bypassed)"}),
+                "value": ("INT", {"default": 0, "tooltip": "Output value (used when node is active)"}),
+            },
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("output",)
+    FUNCTION = "set_value"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Sets the output to a specific integer value. When bypassed, passes through the input value."
+
+    def set_value(self, input, value):
+        return (value,)
+
+    @classmethod
+    def check_lazy_status(cls, input, value):
+        # This indicates which inputs are needed
+        # When bypassed, ComfyUI will pass through the input
+        return ["value"]
+
+class SmartSetFloat:
+    """
+    A node that sets the output to a specific float value.
+    When bypassed, it passes through the input value instead.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input": ("FLOAT", {"default": 0.0, "tooltip": "Input value (used when node is bypassed)"}),
+                "value": ("FLOAT", {"default": 0.0, "tooltip": "Output value (used when node is active)"}),
+            },
+        }
+
+    RETURN_TYPES = ("FLOAT",)
+    RETURN_NAMES = ("output",)
+    FUNCTION = "set_value"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Sets the output to a specific float value. When bypassed, passes through the input value."
+
+    def set_value(self, input, value):
+        return (value,)
+
+    @classmethod
+    def check_lazy_status(cls, input, value):
+        # This indicates which inputs are needed
+        # When bypassed, ComfyUI will pass through the input
+        return ["value"]
+
+class SmartModelInfo:
+    """
+    A node that displays information about a MODEL object and passes it through.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "Model to inspect"}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "info")
+    FUNCTION = "get_model_info"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Displays information about a MODEL object including config details"
+    OUTPUT_NODE = True
+
+    def get_model_info(self, model):
+        info_lines = []
+        
+        # Try to get model config info
+        try:
+            if hasattr(model, 'model') and hasattr(model.model, 'model_config'):
+                config = model.model.model_config
+                info_lines.append("=== Model Config ===")
+                
+                # Get model type/class name
+                if hasattr(config, '__class__'):
+                    info_lines.append(f"Type: {config.__class__.__name__}")
+                
+                # Get unet config if available
+                if hasattr(config, 'unet_config'):
+                    unet_config = config.unet_config
+                    if isinstance(unet_config, dict):
+                        info_lines.append("\n=== UNet Config ===")
+                        for key, value in unet_config.items():
+                            if isinstance(value, (int, float, str, bool)):
+                                info_lines.append(f"{key}: {value}")
+                
+                # Check for latent format
+                if hasattr(config, 'latent_format'):
+                    latent_format = config.latent_format
+                    if hasattr(latent_format, '__class__'):
+                        info_lines.append(f"\nLatent Format: {latent_format.__class__.__name__}")
+        except Exception as e:
+            info_lines.append(f"Error reading model config: {str(e)}")
+        
+        # Check model_options
+        try:
+            if hasattr(model, 'model_options'):
+                options = model.model_options
+                if options and isinstance(options, dict):
+                    info_lines.append("\n=== Model Options ===")
+                    for key, value in options.items():
+                        if key != 'transformer_options' and isinstance(value, (int, float, str, bool)):
+                            info_lines.append(f"{key}: {value}")
+        except Exception as e:
+            info_lines.append(f"Error reading model options: {str(e)}")
+        
+        # Check attachments (where custom data might be stored)
+        try:
+            if hasattr(model, 'attachments'):
+                attachments = model.attachments
+                if attachments and isinstance(attachments, dict):
+                    info_lines.append("\n=== Attachments ===")
+                    for key, value in attachments.items():
+                        info_lines.append(f"{key}: {value}")
+        except Exception as e:
+            info_lines.append(f"Error reading attachments: {str(e)}")
+        
+        if not info_lines:
+            info_lines.append("No model information available")
+        
+        info_text = "\n".join(info_lines)
+        return (model, info_text)
 
 class SmartHWMonitor:
     """
@@ -1207,6 +1607,122 @@ class SmartHWMonitor:
         import time
         return int(time.time() / refresh_rate)
 
+
+_SMARTHELPER_GGUF_PKG = "SmartHelperGGUFPkg"
+
+
+def _get_unet_gguf_filenames():
+    try:
+        return folder_paths.get_filename_list("unet_gguf")
+    except KeyError:
+        return []
+
+
+def _ensure_comfyui_gguf_package():
+    if _SMARTHELPER_GGUF_PKG in sys.modules:
+        return
+    root = None
+    for custom_root in folder_paths.get_folder_paths("custom_nodes"):
+        for name in ("ComfyUI-GGUF", "comfyui-gguf"):
+            candidate = os.path.join(custom_root, name)
+            if os.path.isfile(os.path.join(candidate, "__init__.py")):
+                root = candidate
+                break
+        if root:
+            break
+    if not root:
+        raise RuntimeError(
+            "ComfyUI-GGUF is required for GGUF mode. Install from https://github.com/city96/ComfyUI-GGUF"
+        )
+    init_py = os.path.join(root, "__init__.py")
+    spec = importlib.util.spec_from_file_location(
+        _SMARTHELPER_GGUF_PKG,
+        init_py,
+        submodule_search_locations=[root],
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[_SMARTHELPER_GGUF_PKG] = mod
+    spec.loader.exec_module(mod)
+
+
+def _load_gguf_model(unet_name: str):
+    _ensure_comfyui_gguf_package()
+    nodes_mod = importlib.import_module(f"{_SMARTHELPER_GGUF_PKG}.nodes")
+    return nodes_mod.UnetLoaderGGUF().load_unet(unet_name)[0]
+
+
+def _load_safetensors_diffusion_model(unet_name: str, weight_dtype: str):
+    model_options = {}
+    if weight_dtype == "fp8_e4m3fn":
+        model_options["dtype"] = torch.float8_e4m3fn
+    elif weight_dtype == "fp8_e4m3fn_fast":
+        model_options["dtype"] = torch.float8_e4m3fn
+        model_options["fp8_optimizations"] = True
+    elif weight_dtype == "fp8_e5m2":
+        model_options["dtype"] = torch.float8_e5m2
+    unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+    return comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
+
+
+class SmartModelLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "gguf": ("BOOLEAN", {"default": False}),
+                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],),
+                "gguf_name": (_get_unet_gguf_filenames(),),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "model_name")
+    FUNCTION = "load"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Load a diffusion model from .safetensors (Load Diffusion Model) or .gguf (Unet Loader GGUF)."
+
+    def load(self, gguf, unet_name, weight_dtype, gguf_name):
+        if gguf:
+            model = _load_gguf_model(gguf_name)
+            return (model, gguf_name)
+        model = _load_safetensors_diffusion_model(unet_name, weight_dtype)
+        return (model, unet_name)
+
+
+class SmartDualModelLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "gguf": ("BOOLEAN", {"default": False}),
+                "unet_name_1": (folder_paths.get_filename_list("diffusion_models"),),
+                "unet_name_2": (folder_paths.get_filename_list("diffusion_models"),),
+                "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],),
+                "gguf_name_1": (_get_unet_gguf_filenames(),),
+                "gguf_name_2": (_get_unet_gguf_filenames(),),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "MODEL", "STRING")
+    RETURN_NAMES = ("model_1", "model_2", "model_names")
+    FUNCTION = "load"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Load two diffusion models (safetensors or GGUF) with a combined name summary."
+
+    def load(self, gguf, unet_name_1, unet_name_2, weight_dtype, gguf_name_1, gguf_name_2):
+        if gguf:
+            m1 = _load_gguf_model(gguf_name_1)
+            m2 = _load_gguf_model(gguf_name_2)
+            n1, n2 = gguf_name_1, gguf_name_2
+        else:
+            m1 = _load_safetensors_diffusion_model(unet_name_1, weight_dtype)
+            m2 = _load_safetensors_diffusion_model(unet_name_2, weight_dtype)
+            n1, n2 = unet_name_1, unet_name_2
+        text = f"Model #1: {n1}\nModel #2: {n2}"
+        return (m1, m2, text)
+
+
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
     "SmartHVLoraStack": SmartHVLoraStack,
@@ -1216,10 +1732,20 @@ NODE_CLASS_MAPPINGS = {
     "SmartSaveAnimatedGIF": SmartSaveAnimatedGIF,
     "SmartRemoveComments": SmartRemoveComments,
     "SmartLoadLoRA": SmartLoadLoRA,
+    "SmartLoadDoubleLoRA": SmartLoadDoubleLoRA,
     "SmartPrompt": SmartPrompt,
     "SmartModelOrLoraToString": SmartModelOrLoraToString,
     "SmartShowAnything": SmartShowAnything,
     "SmartHWMonitor": SmartHWMonitor,
+    "SmartSetInt": SmartSetInt,
+    "SmartSetFloat": SmartSetFloat,
+    "SmartBusIn": SmartBusIn,
+    "SmartBusOut": SmartBusOut,
+    "SmartBusIn5": SmartBusIn5,
+    "SmartBusOut5": SmartBusOut5,
+    "SmartModelInfo": SmartModelInfo,
+    "SmartModelLoader": SmartModelLoader,
+    "SmartDualModelLoader": SmartDualModelLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1231,8 +1757,18 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartSaveAnimatedGIF": "Smart Save Animated GIF",
     "SmartRemoveComments": "Smart Remove Comments",
     "SmartLoadLoRA": "Smart Load LoRA",
+    "SmartLoadDoubleLoRA": "Smart Load Double LoRA",
     "SmartPrompt": "Smart Prompt",
     "SmartModelOrLoraToString": "Smart Model or Lora to String",
     "SmartShowAnything": "Smart Show Anything",
     "SmartHWMonitor": "Smart Hardware Monitor",
+    "SmartSetInt": "Smart Set Int",
+    "SmartSetFloat": "Smart Set Float",
+    "SmartBusIn": "Smart Bus In",
+    "SmartBusOut": "Smart Bus Out",
+    "SmartBusIn5": "Smart Bus In 5",
+    "SmartBusOut5": "Smart Bus Out 5",
+    "SmartModelInfo": "Smart Model Info",
+    "SmartModelLoader": "Smart Model Loader",
+    "SmartDualModelLoader": "Smart Dual Model Loader",
 }
