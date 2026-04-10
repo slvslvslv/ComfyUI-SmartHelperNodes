@@ -13,6 +13,7 @@ import re # Added for regex operations
 import random # Added for random choice
 import time # Added for IS_CHANGED
 import platform
+import inspect
 from inspect import cleandoc
 from typing import Any, Dict
 from server import PromptServer
@@ -381,6 +382,23 @@ def _get_smart_bus_node(unique_id=None, extra_pnginfo=None):
     if not workflow:
         return None
 
+    return next((node for node in workflow.get("nodes", []) if str(node.get("id")) == node_id), None)
+
+
+def _get_workflow_node_by_id(node_id=None, extra_pnginfo=None):
+    if node_id is None or not extra_pnginfo:
+        return None
+
+    try:
+        info = extra_pnginfo[0] if isinstance(extra_pnginfo, (list, tuple)) else extra_pnginfo
+        workflow = info.get("workflow")
+    except (IndexError, AttributeError, TypeError):
+        return None
+
+    if not workflow:
+        return None
+
+    node_id = str(node_id)
     return next((node for node in workflow.get("nodes", []) if str(node.get("id")) == node_id), None)
 
 
@@ -1723,6 +1741,195 @@ class SmartDualModelLoader:
         return (m1, m2, text)
 
 
+class SmartGetParametersAsString:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mode": (["full_params", "node_status"], {"default": "full_params"}),
+            },
+            "optional": {
+                "source": (any_type, {"tooltip": "Connect to any node output to read that node's parameters"}),
+                "params_str": ("STRING", {"forceInput": True, "default": ""}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("params_str",)
+    FUNCTION = "get_parameters"
+    CATEGORY = "SmartHelperNodes"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Connect to any node's output to read all its widget parameter names and values as a multi-line string."
+
+    def get_parameters(self, mode, unique_id=None, prompt=None, extra_pnginfo=None, source=None, params_str=""):
+        def _append_value(new_value):
+            if params_str:
+                return (f"{params_str}\n-------------------------------------\n{new_value}",)
+            return (new_value,)
+
+        if prompt is None or unique_id is None:
+            return _append_value("")
+
+        node_id = str(unique_id[0] if isinstance(unique_id, (list, tuple)) else unique_id)
+        my_node = prompt.get(node_id)
+        if not my_node or not isinstance(my_node, dict):
+            return _append_value("")
+
+        source_raw = (my_node.get("inputs") or {}).get("source")
+        if source_raw is None or not is_link(source_raw):
+            return _append_value("No source node connected.")
+
+        source_node_id = str(source_raw[0])
+        source_node = prompt.get(source_node_id)
+        if not source_node or not isinstance(source_node, dict):
+            return _append_value(f"Could not find source node {source_node_id}.")
+
+        node_title = source_node.get("class_type", "Unknown")
+        node_status = "ON"
+        workflow_node = _get_workflow_node_by_id(source_node_id, extra_pnginfo)
+        if workflow_node:
+            node_title = workflow_node.get("title") or node_title
+            node_mode = workflow_node.get("mode", 0)
+            if node_mode == 2:
+                node_status = "muted"
+            elif node_mode == 4:
+                node_status = "bypassed"
+
+        if mode == "node_status":
+            return _append_value(f"{node_title}: {node_status}")
+
+        if node_status != "ON":
+            return _append_value(f"NODE: {node_title}, {node_status}")
+
+        source_inputs = source_node.get("inputs", {})
+        lines = [f"NODE: {node_title}"]
+
+        for param_name, param_value in source_inputs.items():
+            if is_link(param_value):
+                lines.append(f"{param_name}: <linked>")
+            else:
+                lines.append(f"{param_name}: {param_value}")
+
+        return _append_value("\n".join(lines))
+
+
+class SmartBypassSwitcher:
+    @classmethod
+    def INPUT_TYPES(cls):
+        dynamic_inputs = {
+            "input1": (any_type, {"lazy": True, "tooltip": "Value to pass through when control 1 is active."}),
+            "control1": (any_type, {"lazy": True, "tooltip": "Connect any node output here. If that source node is active, input 1 is selected."}),
+        }
+
+        stack = inspect.stack()
+        if len(stack) > 1 and stack[1].function == "get_input_info":
+            class AllContainer:
+                def __contains__(self, item):
+                    return True
+
+                def __getitem__(self, key):
+                    if str(key).startswith("control"):
+                        return any_type, {"lazy": True}
+                    return any_type, {"lazy": True}
+
+            dynamic_inputs = AllContainer()
+
+        return {
+            "required": {},
+            "optional": dynamic_inputs,
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = (any_type, "INT")
+    RETURN_NAMES = ("value", "selected_index")
+    FUNCTION = "switch"
+    CATEGORY = "SmartHelperNodes"
+    DESCRIPTION = "Selects the first input whose matching control source node is connected and not muted or bypassed."
+
+    @staticmethod
+    def _normalize_unique_id(unique_id):
+        if unique_id is None:
+            return None
+        if isinstance(unique_id, (list, tuple)):
+            if not unique_id:
+                return None
+            return str(unique_id[0])
+        return str(unique_id)
+
+    @classmethod
+    def _get_candidate_indices(cls, node_inputs):
+        indices = set()
+        for key in (node_inputs or {}):
+            if key.startswith("input") or key.startswith("control"):
+                suffix = key[5:] if key.startswith("input") else key[7:]
+                if suffix.isdigit():
+                    indices.add(int(suffix))
+        return sorted(indices)
+
+    @classmethod
+    def _get_selected_index(cls, prompt, unique_id, extra_pnginfo):
+        if prompt is None:
+            return 0
+
+        node_id = cls._normalize_unique_id(unique_id)
+        if node_id is None:
+            return 0
+
+        switch_node = prompt.get(node_id)
+        if not isinstance(switch_node, dict):
+            return 0
+
+        node_inputs = switch_node.get("inputs") or {}
+        for index in cls._get_candidate_indices(node_inputs):
+            control_key = f"control{index}"
+            control_raw = node_inputs.get(control_key)
+            if control_raw is None or not is_link(control_raw):
+                continue
+
+            control_node_id = str(control_raw[0])
+            workflow_node = _get_workflow_node_by_id(control_node_id, extra_pnginfo)
+            if workflow_node:
+                node_mode = workflow_node.get("mode", 0)
+                if node_mode in (2, 4):
+                    continue
+
+            input_key = f"input{index}"
+            input_raw = node_inputs.get(input_key)
+            if input_raw is None or not is_link(input_raw):
+                continue
+
+            return index
+
+        return 0
+
+    def check_lazy_status(self, *args, **kwargs):
+        selected_index = self._get_selected_index(
+            kwargs.get("prompt"),
+            kwargs.get("unique_id"),
+            kwargs.get("extra_pnginfo"),
+        )
+        if selected_index <= 0:
+            return []
+        return [f"input{selected_index}"]
+
+    def switch(self, unique_id=None, prompt=None, extra_pnginfo=None, **kwargs):
+        selected_index = self._get_selected_index(prompt, unique_id, extra_pnginfo)
+        if selected_index <= 0:
+            return (None, 0)
+
+        selected_key = f"input{selected_index}"
+        return (kwargs.get(selected_key), selected_index)
+
+
 NODE_CLASS_MAPPINGS = {
     "SmartHVLoraSelect": SmartHVLoraSelect,
     "SmartHVLoraStack": SmartHVLoraStack,
@@ -1746,6 +1953,8 @@ NODE_CLASS_MAPPINGS = {
     "SmartModelInfo": SmartModelInfo,
     "SmartModelLoader": SmartModelLoader,
     "SmartDualModelLoader": SmartDualModelLoader,
+    "SmartGetParametersAsString": SmartGetParametersAsString,
+    "SmartBypassSwitcher": SmartBypassSwitcher,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1771,4 +1980,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartModelInfo": "Smart Model Info",
     "SmartModelLoader": "Smart Model Loader",
     "SmartDualModelLoader": "Smart Dual Model Loader",
+    "SmartGetParametersAsString": "Smart Get Parameters As String",
+    "SmartBypassSwitcher": "Bypass Switcher",
 }

@@ -322,6 +322,71 @@ function setupVisibilityHandler(node, countWidgetName, blockType) {
     return countWidget;
 }
 
+function isBypassSwitcherNodeType(nodeType) {
+    return nodeType === "SmartBypassSwitcher";
+}
+
+function getBypassSwitcherPairCount(node) {
+    return Math.max(1, Math.floor((node.inputs?.length || 0) / 2));
+}
+
+function renameBypassSwitcherInputs(node) {
+    const pairCount = getBypassSwitcherPairCount(node);
+    for (let i = 0; i < pairCount; i++) {
+        const inputSlot = node.inputs?.[i * 2];
+        const controlSlot = node.inputs?.[i * 2 + 1];
+        if (inputSlot) {
+            inputSlot.name = `input${i + 1}`;
+        }
+        if (controlSlot) {
+            controlSlot.name = `control${i + 1}`;
+        }
+    }
+}
+
+function hasBypassSwitcherPairConnection(node, pairIndex) {
+    const inputSlot = node.inputs?.[pairIndex * 2];
+    const controlSlot = node.inputs?.[pairIndex * 2 + 1];
+    return Boolean(inputSlot?.link != null || controlSlot?.link != null);
+}
+
+function syncBypassSwitcherInputs(node) {
+    if (!node?.inputs?.length) {
+        return;
+    }
+
+    renameBypassSwitcherInputs(node);
+
+    let lastConnectedPair = -1;
+    const pairCount = getBypassSwitcherPairCount(node);
+    for (let i = 0; i < pairCount; i++) {
+        if (hasBypassSwitcherPairConnection(node, i)) {
+            lastConnectedPair = i;
+        }
+    }
+
+    const desiredPairCount = Math.max(1, lastConnectedPair + 2);
+
+    while (getBypassSwitcherPairCount(node) < desiredPairCount) {
+        const nextIndex = getBypassSwitcherPairCount(node) + 1;
+        node.addInput(`input${nextIndex}`, "*");
+        node.addInput(`control${nextIndex}`, "*");
+    }
+
+    while (getBypassSwitcherPairCount(node) > desiredPairCount) {
+        const lastPairIndex = getBypassSwitcherPairCount(node) - 1;
+        if (hasBypassSwitcherPairConnection(node, lastPairIndex)) {
+            break;
+        }
+        node.removeInput(node.inputs.length - 1);
+        node.removeInput(node.inputs.length - 1);
+    }
+
+    renameBypassSwitcherInputs(node);
+    node.setDirtyCanvas?.(true, true);
+    node.graph?.setDirtyCanvas?.(true, true);
+}
+
 // Update the registerExtension implementation
 app.registerExtension({
     name: "SmartHelperNodes",
@@ -477,6 +542,29 @@ app.registerExtension({
                 if (isSmartBusInNodeType(nodeData.name)) {
                     syncConnectedSmartBusOutputs(this);
                 }
+                return result;
+            };
+        }
+
+        if (isBypassSwitcherNodeType(nodeData.name)) {
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                const result = onNodeCreated?.apply(this, arguments);
+                syncBypassSwitcherInputs(this);
+                return result;
+            };
+
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                const result = onConfigure?.apply(this, arguments);
+                syncBypassSwitcherInputs(this);
+                return result;
+            };
+
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+            nodeType.prototype.onConnectionsChange = function () {
+                const result = onConnectionsChange?.apply(this, arguments);
+                syncBypassSwitcherInputs(this);
                 return result;
             };
         }

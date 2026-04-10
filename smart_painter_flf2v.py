@@ -1,0 +1,508 @@
+import torch
+import torch.nn.functional as F
+import comfy.clip_vision
+import comfy.model_management
+import comfy.utils
+import node_helpers
+
+
+class SmartPainterFLF2V:
+    """
+    Smart variation of PainterFLF2V with dual high/low noise outputs,
+    bidirectional motion amplitude, configurable mask fade/spread,
+    temporal latent smoothing, end-frame noise-burst fix, and
+    per-expert end-frame strength control.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "vae": ("VAE",),
+                "width": ("INT", {"default": 832, "min": 16, "max": 8192, "step": 16}),
+                "height": ("INT", {"default": 480, "min": 16, "max": 8192, "step": 16}),
+                "length": ("INT", {"default": 81, "min": 1, "max": 8192, "step": 4}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                "motion_amplitude": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": (
+                        "DISABLED at 1.0 — outputs official vanilla behavior (gray-fill between keyframes).\n"
+                        "\n"
+                        "Controls how much the model deviates from a smooth start-to-end transition.\n"
+                        "\n"
+                        "Lowering toward 0.0: blends the conditioning latent toward a linear interpolation "
+                        "between start and end frames — suppresses camera drift/reinterpretation, "
+                        "making the output increasingly static.\n"
+                        "At 0.0 it is pure linear crossfade.\n"
+                        "\n"
+                        "Raising above 1.0: amplifies high-frequency structural differences (the 'anti-ghost' signal), "
+                        "boosting subject motion and removing slow-motion feel, but may increase camera instability.\n"
+                        "\n"
+                        "For static camera try 0.3-0.7.\n"
+                        "For dynamic motion try 1.2-1.8."
+                    ),
+                }),
+                "mask_fade_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 40, "step": 1,
+                    "tooltip": (
+                        "DISABLED at 0 — mask uses hard edges only (official behavior).\n"
+                        "\n"
+                        "Number of extra pixel frames after the start keyframe (and before the end keyframe) "
+                        "where the mask gradually transitions instead of jumping from 0 to 1.\n"
+                        "\n"
+                        "Raising this extends the 'influence zone' of your keyframes deeper into the video, "
+                        "giving the model a gradual ramp from anchored to free.\n"
+                        "\n"
+                        "Higher values = wider gradient = more frames stay partially anchored = "
+                        "more stable camera but less creative freedom for the model in the middle.\n"
+                        "\n"
+                        "For static camera try 8-16.\n"
+                        "For dynamic scenes keep at 0-4."
+                    ),
+                }),
+                "mask_fade_min": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Only active when mask_fade_frames > 0.\n"
+                        "\n"
+                        "Mask value at the keyframe edge of the fade ramp (closest to start/end image).\n"
+                        "0.0 = fully anchored (model must follow the conditioning exactly).\n"
+                        "\n"
+                        "Raising this loosens the anchor even at the boundary — the model gets partial freedom "
+                        "right next to keyframes.\n"
+                        "Useful if you want soft transitions rather than hard locks.\n"
+                        "\n"
+                        "For maximum camera stability keep at 0.0."
+                    ),
+                }),
+                "mask_fade_max": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Only active when mask_fade_frames > 0.\n"
+                        "\n"
+                        "Mask value at the far edge of the fade ramp (farthest from the keyframe).\n"
+                        "1.0 = fully free (model can generate whatever it wants beyond the fade).\n"
+                        "\n"
+                        "Lowering this caps how free the model gets even in the middle of the video — "
+                        "e.g. 0.6 means the model is never more than 60%% free, always partially anchored.\n"
+                        "\n"
+                        "Lower values = tighter overall constraint = more stable but less dynamic.\n"
+                        "\n"
+                        "For static camera try 0.5-0.7.\n"
+                        "For full motion keep at 1.0."
+                    ),
+                }),
+                "high_noise_end_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "DISABLED at 1.0 — end frame has full influence for the high-noise expert.\n"
+                        "\n"
+                        "Controls how strongly the end frame conditions the HIGH-noise model step.\n"
+                        "Affects both the mask (anchoring strength) and the pixel image "
+                        "(blends end frame toward neutral gray).\n"
+                        "\n"
+                        "The high-noise expert establishes coarse structure — giving it less end-frame "
+                        "constraint lets it find a more natural motion path, reducing the end-frame noise burst.\n"
+                        "\n"
+                        "Lowering toward 0.0: weakens end-frame conditioning for the high-noise step.\n"
+                        "At 0.0 the high-noise expert completely ignores the end frame.\n"
+                        "\n"
+                        "For two-step WAN, try 0.6-0.8 to reduce end noise while still guiding toward the target."
+                    ),
+                }),
+                "low_noise_end_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "DISABLED at 1.0 — end frame has full influence for the low-noise expert.\n"
+                        "\n"
+                        "Controls how strongly the end frame conditions the LOW-noise model step.\n"
+                        "Affects both the mask (anchoring strength) and the pixel image "
+                        "(blends end frame toward neutral gray).\n"
+                        "\n"
+                        "The low-noise expert refines details — keeping it tightly anchored to the "
+                        "end frame ensures the final result actually arrives at the target.\n"
+                        "\n"
+                        "Lowering toward 0.0: weakens end-frame conditioning for the low-noise step.\n"
+                        "At 0.0 the low-noise expert completely ignores the end frame.\n"
+                        "\n"
+                        "Usually keep at 1.0 (full strength) so the refiner locks in the end frame."
+                    ),
+                }),
+                "end_anchor_extra": ("INT", {
+                    "default": 3, "min": 0, "max": 12, "step": 1,
+                    "tooltip": (
+                        "DISABLED at 0 — end frame uses official mask (only the end frame pixel slot is anchored, "
+                        "leaving the last latent block 75%% free — this causes the end-frame noise burst).\n"
+                        "\n"
+                        "Fixes a WAN FLF2V design asymmetry: the start frame gets +3 extra mask slots "
+                        "to fill a full latent block, but the end frame does not.\n"
+                        "\n"
+                        "At 3 (recommended): mirrors the start-frame treatment, anchoring the full last latent block "
+                        "and blending the 3 pre-end pixel frames toward the end image for smoother VAE encoding.\n"
+                        "\n"
+                        "Higher values extend anchoring + blending even deeper before the end frame.\n"
+                        "\n"
+                        "This eliminates most of the noise burst visible in the last 3-7 frames during early denoising."
+                    ),
+                }),
+                "temporal_smooth_sigma": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "tooltip": (
+                        "DISABLED at 0.0 — no temporal smoothing applied.\n"
+                        "\n"
+                        "Gaussian sigma for temporal smoothing of the conditioning latent.\n"
+                        "\n"
+                        "Higher values widen the blur kernel, averaging each frame with more distant neighbors — "
+                        "strongly stabilizes camera and reduces jitter but dampens subject motion.\n"
+                        "\n"
+                        "Lower values only blend adjacent frames, removing high-freq temporal noise "
+                        "while preserving most motion dynamics.\n"
+                        "\n"
+                        "Start around 1.0-2.0 for static camera."
+                    ),
+                }),
+                "temporal_smooth_kernel": ("INT", {
+                    "default": 5, "min": 1, "max": 21, "step": 2,
+                    "tooltip": (
+                        "Only active when temporal_smooth_sigma > 0.\n"
+                        "At 1: smoothing is a no-op (single-sample kernel).\n"
+                        "\n"
+                        "Size of the temporal Gaussian smoothing window (odd values work best; even rounded up).\n"
+                        "\n"
+                        "Raising this allows the Gaussian to reach more distant frames — needed when sigma is high, "
+                        "otherwise the kernel gets clipped and the smoothing is weaker than expected.\n"
+                        "\n"
+                        "Lowering this limits the reach even if sigma is large, capping the blur range.\n"
+                        "\n"
+                        "Rule of thumb: kernel >= 2*sigma + 1.\n"
+                        "For sigma 1.0 use 5.\n"
+                        "For sigma 3.0 use 9-11."
+                    ),
+                }),
+            },
+            "optional": {
+                "clip_vision_start_image": ("CLIP_VISION_OUTPUT",),
+                "clip_vision_end_image": ("CLIP_VISION_OUTPUT",),
+                "start_image": ("IMAGE",),
+                "end_image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive_high", "positive_low", "negative", "latent")
+    FUNCTION = "execute"
+    CATEGORY = "SmartHelperNodes/Wan"
+    DESCRIPTION = (
+        "Smart Painter FLF2V: First-Last-Frame video conditioning for two-step WAN workflows.\n"
+        "Outputs separate positive_high and positive_low conditioning with independent "
+        "end-frame strength per expert model.\n"
+        "Features: bidirectional motion amplitude, mask fade/spread, temporal smoothing, "
+        "and end-frame noise-burst fix."
+    )
+
+    def execute(
+        self,
+        positive,
+        negative,
+        vae,
+        width,
+        height,
+        length,
+        batch_size,
+        motion_amplitude=1.0,
+        mask_fade_frames=0,
+        mask_fade_min=0.0,
+        mask_fade_max=1.0,
+        high_noise_end_strength=1.0,
+        low_noise_end_strength=1.0,
+        end_anchor_extra=3,
+        temporal_smooth_sigma=0.0,
+        temporal_smooth_kernel=5,
+        start_image=None,
+        end_image=None,
+        clip_vision_start_image=None,
+        clip_vision_end_image=None,
+    ):
+        spacial_scale = vae.spacial_compression_encode()
+        latent_frames = ((length - 1) // 4) + 1
+        device = comfy.model_management.intermediate_device()
+
+        latent = torch.zeros(
+            [batch_size, vae.latent_channels, latent_frames, height // spacial_scale, width // spacial_scale],
+            device=device,
+        )
+
+        if start_image is not None:
+            start_image = comfy.utils.common_upscale(
+                start_image[:length].movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)
+        if end_image is not None:
+            end_image = comfy.utils.common_upscale(
+                end_image[-length:].movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)
+
+        # --- build pixel images (one per expert when strengths differ) ---
+        needs_separate = (
+            end_image is not None
+            and abs(high_noise_end_strength - low_noise_end_strength) > 0.001
+        )
+
+        image_high = self._build_pixel_image(
+            length, height, width, device,
+            start_image, end_image, high_noise_end_strength, end_anchor_extra,
+        )
+        if needs_separate:
+            image_low = self._build_pixel_image(
+                length, height, width, device,
+                start_image, end_image, low_noise_end_strength, end_anchor_extra,
+            )
+        else:
+            image_low = image_high
+
+        latent_high = vae.encode(image_high[:, :, :, :3])
+        if needs_separate:
+            latent_low = vae.encode(image_low[:, :, :, :3])
+        else:
+            latent_low = latent_high
+
+        # --- motion amplitude (applied to both) ---
+        concat_high = self._apply_amplitude_to_latent(
+            latent_high, start_image, end_image, length, motion_amplitude, vae, device,
+        )
+        if needs_separate:
+            concat_low = self._apply_amplitude_to_latent(
+                latent_low, start_image, end_image, length, motion_amplitude, vae, device,
+            )
+        else:
+            concat_low = concat_high
+
+        # --- temporal smoothing (applied to both) ---
+        if temporal_smooth_sigma > 0.0:
+            if concat_high.shape[2] > 1:
+                concat_high = self._temporal_smooth(
+                    concat_high, temporal_smooth_sigma, temporal_smooth_kernel,
+                    start_image, end_image,
+                )
+            if needs_separate and concat_low.shape[2] > 1:
+                concat_low = self._temporal_smooth(
+                    concat_low, temporal_smooth_sigma, temporal_smooth_kernel,
+                    start_image, end_image,
+                )
+            elif not needs_separate:
+                concat_low = concat_high
+
+        # --- masks (separate per expert) ---
+        mask_high = self._build_mask(
+            latent_frames, latent.shape[-2], latent.shape[-1],
+            start_image, end_image, length,
+            mask_fade_frames, mask_fade_min, mask_fade_max,
+            high_noise_end_strength, end_anchor_extra, device,
+        )
+        mask_high = mask_high.view(1, mask_high.shape[2] // 4, 4, mask_high.shape[3], mask_high.shape[4]).transpose(1, 2)
+
+        if abs(high_noise_end_strength - low_noise_end_strength) > 0.001:
+            mask_low = self._build_mask(
+                latent_frames, latent.shape[-2], latent.shape[-1],
+                start_image, end_image, length,
+                mask_fade_frames, mask_fade_min, mask_fade_max,
+                low_noise_end_strength, end_anchor_extra, device,
+            )
+            mask_low = mask_low.view(1, mask_low.shape[2] // 4, 4, mask_low.shape[3], mask_low.shape[4]).transpose(1, 2)
+        else:
+            mask_low = mask_high
+
+        # --- inject conditioning ---
+        positive_high = node_helpers.conditioning_set_values(
+            positive, {"concat_latent_image": concat_high, "concat_mask": mask_high},
+        )
+        positive_low = node_helpers.conditioning_set_values(
+            positive, {"concat_latent_image": concat_low, "concat_mask": mask_low},
+        )
+        negative_out = node_helpers.conditioning_set_values(
+            negative, {"concat_latent_image": concat_high, "concat_mask": mask_high},
+        )
+
+        # --- clip vision ---
+        clip_vision_output = self._merge_clip_vision(clip_vision_start_image, clip_vision_end_image)
+        if clip_vision_output is not None:
+            positive_high = node_helpers.conditioning_set_values(positive_high, {"clip_vision_output": clip_vision_output})
+            positive_low = node_helpers.conditioning_set_values(positive_low, {"clip_vision_output": clip_vision_output})
+            negative_out = node_helpers.conditioning_set_values(negative_out, {"clip_vision_output": clip_vision_output})
+
+        return (positive_high, positive_low, negative_out, {"samples": latent})
+
+    # ------------------------------------------------------------------
+    # Pixel image builder (reusable per expert)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_pixel_image(length, height, width, device,
+                           start_image, end_image, end_strength, end_anchor_extra):
+        image = torch.ones((length, height, width, 3), device=device) * 0.5
+        if start_image is not None:
+            image[:start_image.shape[0]] = start_image
+        if end_image is not None:
+            if end_strength < 1.0:
+                blended = 0.5 + (end_image - 0.5) * end_strength
+                image[-end_image.shape[0]:] = blended
+            else:
+                image[-end_image.shape[0]:] = end_image
+            if end_anchor_extra > 0:
+                ref = image[-end_image.shape[0]]
+                for i in range(1, end_anchor_extra + 1):
+                    idx = -(end_image.shape[0] + i)
+                    if abs(idx) <= length:
+                        alpha = 1.0 - (i / (end_anchor_extra + 1.0))
+                        image[idx] = image[idx] * (1.0 - alpha) + ref * alpha
+        return image
+
+    # ------------------------------------------------------------------
+    # Motion amplitude wrapper
+    # ------------------------------------------------------------------
+    def _apply_amplitude_to_latent(self, encoded_latent, start_image, end_image,
+                                   length, amplitude, vae, device):
+        if start_image is not None and end_image is not None and length > 2:
+            start_l = encoded_latent[:, :, 0:1]
+            end_l = encoded_latent[:, :, -1:]
+            t = torch.linspace(0.0, 1.0, encoded_latent.shape[2], device=device).view(1, 1, -1, 1, 1)
+            linear = start_l * (1.0 - t) + end_l * t
+        else:
+            linear = encoded_latent
+        return self._apply_motion_amplitude(
+            encoded_latent, linear, amplitude, vae.latent_channels,
+            start_image, end_image, length,
+        )
+
+    # ------------------------------------------------------------------
+    # Motion amplitude: bidirectional
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _apply_motion_amplitude(official_latent, linear_latent, amplitude, latent_ch,
+                                start_image, end_image, length):
+        has_both = start_image is not None and end_image is not None
+        if not has_both or length <= 2:
+            return official_latent
+
+        if amplitude < 0.999:
+            stabilize = 1.0 - amplitude
+            return official_latent * (1.0 - stabilize) + linear_latent * stabilize
+
+        if amplitude > 1.001:
+            diff = official_latent - linear_latent
+            h, w = diff.shape[-2], diff.shape[-1]
+
+            low_freq = F.interpolate(
+                diff.reshape(-1, latent_ch, h, w),
+                size=(max(1, h // 8), max(1, w // 8)), mode="area",
+            )
+            low_freq = F.interpolate(low_freq, size=(h, w), mode="bilinear", align_corners=False)
+            low_freq = low_freq.view_as(diff)
+
+            high_freq = diff - low_freq
+            boost = (amplitude - 1.0) * 4.0
+            return official_latent + high_freq * boost
+
+        return official_latent
+
+    # ------------------------------------------------------------------
+    # Temporal Gaussian smoothing (preserves keyframe latents)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _temporal_smooth(latent, sigma, kernel_size, start_image, end_image):
+        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        if kernel_size < 3:
+            return latent
+        half = kernel_size // 2
+        T = latent.shape[2]
+        if T <= 1:
+            return latent
+
+        coords = torch.arange(kernel_size, device=latent.device, dtype=latent.dtype) - half
+        kernel = torch.exp(-0.5 * (coords / max(sigma, 1e-6)) ** 2)
+        kernel = kernel / kernel.sum()
+        kernel = kernel.view(1, 1, -1, 1, 1)
+
+        B, C, _, H, W = latent.shape
+        inp = latent.reshape(1, B * C, T, H, W)
+        inp = F.pad(inp, (0, 0, 0, 0, half, half), mode="replicate")
+        weight = kernel.expand(B * C, 1, kernel_size, 1, 1)
+        smoothed = F.conv3d(inp, weight, groups=B * C)
+        smoothed = smoothed.reshape(B, C, T, H, W)
+
+        if start_image is not None:
+            n = min(start_image.shape[0], T)
+            lat_n = max(1, (n - 1) // 4 + 1)
+            smoothed[:, :, :lat_n] = latent[:, :, :lat_n]
+        if end_image is not None:
+            n = min(end_image.shape[0], T)
+            lat_n = max(1, (n - 1) // 4 + 1)
+            smoothed[:, :, -lat_n:] = latent[:, :, -lat_n:]
+
+        return smoothed
+
+    # ------------------------------------------------------------------
+    # Mask builder with configurable fade/spread and end-anchor fix
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_mask(latent_frames, lat_h, lat_w, start_image, end_image, length,
+                    fade_frames, fade_min, fade_max,
+                    end_frame_strength, end_anchor_extra, device):
+        total_pixel_frames = latent_frames * 4
+        mask = torch.ones((1, 1, total_pixel_frames, lat_h, lat_w), device=device)
+
+        n_start = start_image.shape[0] if start_image is not None else 0
+        n_end = end_image.shape[0] if end_image is not None else 0
+
+        if n_start > 0:
+            mask[:, :, :n_start + 3] = 0.0
+
+        if n_end > 0:
+            end_mask_value = 1.0 - end_frame_strength
+            end_anchor = n_end + end_anchor_extra
+            end_anchor = min(end_anchor, total_pixel_frames)
+            mask[:, :, -end_anchor:] = end_mask_value
+
+        if fade_frames > 0:
+            if n_start > 0:
+                fade_start_idx = n_start + 3
+                fade_end_idx = min(fade_start_idx + fade_frames, total_pixel_frames)
+                n_fade = fade_end_idx - fade_start_idx
+                if n_fade > 0:
+                    ramp = torch.linspace(fade_min, fade_max, n_fade, device=device)
+                    mask[:, :, fade_start_idx:fade_end_idx] = ramp.view(1, 1, -1, 1, 1)
+
+            if n_end > 0:
+                end_anchor = n_end + end_anchor_extra
+                fade_end_idx = total_pixel_frames - end_anchor
+                fade_start_idx = max(fade_end_idx - fade_frames, 0)
+                if n_start > 0:
+                    fade_start_idx = max(fade_start_idx, n_start + 3 + fade_frames)
+                n_fade = fade_end_idx - fade_start_idx
+                if n_fade > 0:
+                    ramp = torch.linspace(fade_max, fade_min, n_fade, device=device)
+                    mask[:, :, fade_start_idx:fade_end_idx] = ramp.view(1, 1, -1, 1, 1)
+
+        return mask
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _merge_clip_vision(*outputs):
+        valid = [o for o in outputs if o is not None]
+        if not valid:
+            return None
+        if len(valid) == 1:
+            return valid[0]
+        states = torch.cat([o.penultimate_hidden_states for o in valid], dim=-2)
+        result = comfy.clip_vision.Output()
+        result.penultimate_hidden_states = states
+        return result
+
+
+NODE_CLASS_MAPPINGS = {
+    "SmartPainterFLF2V": SmartPainterFLF2V,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "SmartPainterFLF2V": "Smart Painter FLF2V",
+}
