@@ -10,8 +10,8 @@ class SmartPainterFLF2V:
     """
     Smart variation of PainterFLF2V with dual high/low noise outputs,
     bidirectional motion amplitude, configurable mask fade/spread,
-    temporal latent smoothing, end-frame noise-burst fix, and
-    per-expert end-frame strength control.
+    temporal latent smoothing, end-frame noise-burst fix,
+    per-expert end-frame strength, and end-frame offset.
     """
 
     @classmethod
@@ -147,6 +147,27 @@ class SmartPainterFLF2V:
                         "This eliminates most of the noise burst visible in the last 3-7 frames during early denoising."
                     ),
                 }),
+                "end_frame_offset": ("INT", {
+                    "default": 0, "min": 0, "max": 80, "step": 4,
+                    "tooltip": (
+                        "DISABLED at 0 — end frame is placed at the very last frame (official behavior).\n"
+                        "\n"
+                        "Shifts the end frame forward by this many pixel frames. "
+                        "The model anchors to the end image at the shifted position, then continues "
+                        "generating freely for the remaining tail frames.\n"
+                        "\n"
+                        "Snapped to multiples of 4 internally to align with VAE latent block boundaries.\n"
+                        "\n"
+                        "Example: length=81, offset=8 → end image is placed at frame 72, "
+                        "frames 73-80 are free continuation.\n"
+                        "\n"
+                        "Use this to make the model 'pass through' a target pose and keep moving, "
+                        "rather than decelerating into a hard stop at the end frame.\n"
+                        "\n"
+                        "The tail frames have no target — expect some drift. "
+                        "Keep offset moderate (8-16) for best quality."
+                    ),
+                }),
                 "temporal_smooth_sigma": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 5.0, "step": 0.1,
                     "tooltip": (
@@ -199,7 +220,7 @@ class SmartPainterFLF2V:
         "Outputs separate positive_high and positive_low conditioning with independent "
         "end-frame strength per expert model.\n"
         "Features: bidirectional motion amplitude, mask fade/spread, temporal smoothing, "
-        "and end-frame noise-burst fix."
+        "end-frame noise-burst fix, and end-frame offset for continuation beyond target."
     )
 
     def execute(
@@ -218,6 +239,7 @@ class SmartPainterFLF2V:
         high_noise_end_strength=1.0,
         low_noise_end_strength=1.0,
         end_anchor_extra=3,
+        end_frame_offset=0,
         temporal_smooth_sigma=0.0,
         temporal_smooth_kernel=5,
         start_image=None,
@@ -225,6 +247,10 @@ class SmartPainterFLF2V:
         clip_vision_start_image=None,
         clip_vision_end_image=None,
     ):
+        end_frame_offset = (end_frame_offset // 4) * 4
+        end_frame_offset = min(end_frame_offset, length - 2)
+        end_lat_offset = end_frame_offset // 4
+
         spacial_scale = vae.spacial_compression_encode()
         latent_frames = ((length - 1) // 4) + 1
         device = comfy.model_management.intermediate_device()
@@ -243,7 +269,6 @@ class SmartPainterFLF2V:
                 end_image[-length:].movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
 
-        # --- build pixel images (one per expert when strengths differ) ---
         needs_separate = (
             end_image is not None
             and abs(high_noise_end_strength - low_noise_end_strength) > 0.001
@@ -251,12 +276,14 @@ class SmartPainterFLF2V:
 
         image_high = self._build_pixel_image(
             length, height, width, device,
-            start_image, end_image, high_noise_end_strength, end_anchor_extra,
+            start_image, end_image, high_noise_end_strength,
+            end_anchor_extra, end_frame_offset,
         )
         if needs_separate:
             image_low = self._build_pixel_image(
                 length, height, width, device,
-                start_image, end_image, low_noise_end_strength, end_anchor_extra,
+                start_image, end_image, low_noise_end_strength,
+                end_anchor_extra, end_frame_offset,
             )
         else:
             image_low = image_high
@@ -267,53 +294,57 @@ class SmartPainterFLF2V:
         else:
             latent_low = latent_high
 
-        # --- motion amplitude (applied to both) ---
         concat_high = self._apply_amplitude_to_latent(
-            latent_high, start_image, end_image, length, motion_amplitude, vae, device,
+            latent_high, start_image, end_image, length,
+            motion_amplitude, vae, device, end_lat_offset,
         )
         if needs_separate:
             concat_low = self._apply_amplitude_to_latent(
-                latent_low, start_image, end_image, length, motion_amplitude, vae, device,
+                latent_low, start_image, end_image, length,
+                motion_amplitude, vae, device, end_lat_offset,
             )
         else:
             concat_low = concat_high
 
-        # --- temporal smoothing (applied to both) ---
         if temporal_smooth_sigma > 0.0:
             if concat_high.shape[2] > 1:
                 concat_high = self._temporal_smooth(
                     concat_high, temporal_smooth_sigma, temporal_smooth_kernel,
-                    start_image, end_image,
+                    start_image, end_image, end_lat_offset,
                 )
             if needs_separate and concat_low.shape[2] > 1:
                 concat_low = self._temporal_smooth(
                     concat_low, temporal_smooth_sigma, temporal_smooth_kernel,
-                    start_image, end_image,
+                    start_image, end_image, end_lat_offset,
                 )
             elif not needs_separate:
                 concat_low = concat_high
 
-        # --- masks (separate per expert) ---
         mask_high = self._build_mask(
             latent_frames, latent.shape[-2], latent.shape[-1],
             start_image, end_image, length,
             mask_fade_frames, mask_fade_min, mask_fade_max,
-            high_noise_end_strength, end_anchor_extra, device,
+            high_noise_end_strength, end_anchor_extra,
+            end_frame_offset, device,
         )
-        mask_high = mask_high.view(1, mask_high.shape[2] // 4, 4, mask_high.shape[3], mask_high.shape[4]).transpose(1, 2)
+        mask_high = mask_high.view(
+            1, mask_high.shape[2] // 4, 4, mask_high.shape[3], mask_high.shape[4],
+        ).transpose(1, 2)
 
         if abs(high_noise_end_strength - low_noise_end_strength) > 0.001:
             mask_low = self._build_mask(
                 latent_frames, latent.shape[-2], latent.shape[-1],
                 start_image, end_image, length,
                 mask_fade_frames, mask_fade_min, mask_fade_max,
-                low_noise_end_strength, end_anchor_extra, device,
+                low_noise_end_strength, end_anchor_extra,
+                end_frame_offset, device,
             )
-            mask_low = mask_low.view(1, mask_low.shape[2] // 4, 4, mask_low.shape[3], mask_low.shape[4]).transpose(1, 2)
+            mask_low = mask_low.view(
+                1, mask_low.shape[2] // 4, 4, mask_low.shape[3], mask_low.shape[4],
+            ).transpose(1, 2)
         else:
             mask_low = mask_high
 
-        # --- inject conditioning ---
         positive_high = node_helpers.conditioning_set_values(
             positive, {"concat_latent_image": concat_high, "concat_mask": mask_high},
         )
@@ -324,35 +355,46 @@ class SmartPainterFLF2V:
             negative, {"concat_latent_image": concat_high, "concat_mask": mask_high},
         )
 
-        # --- clip vision ---
         clip_vision_output = self._merge_clip_vision(clip_vision_start_image, clip_vision_end_image)
         if clip_vision_output is not None:
-            positive_high = node_helpers.conditioning_set_values(positive_high, {"clip_vision_output": clip_vision_output})
-            positive_low = node_helpers.conditioning_set_values(positive_low, {"clip_vision_output": clip_vision_output})
-            negative_out = node_helpers.conditioning_set_values(negative_out, {"clip_vision_output": clip_vision_output})
+            positive_high = node_helpers.conditioning_set_values(
+                positive_high, {"clip_vision_output": clip_vision_output},
+            )
+            positive_low = node_helpers.conditioning_set_values(
+                positive_low, {"clip_vision_output": clip_vision_output},
+            )
+            negative_out = node_helpers.conditioning_set_values(
+                negative_out, {"clip_vision_output": clip_vision_output},
+            )
 
         return (positive_high, positive_low, negative_out, {"samples": latent})
 
     # ------------------------------------------------------------------
-    # Pixel image builder (reusable per expert)
+    # Pixel image builder
     # ------------------------------------------------------------------
     @staticmethod
     def _build_pixel_image(length, height, width, device,
-                           start_image, end_image, end_strength, end_anchor_extra):
+                           start_image, end_image, end_strength,
+                           end_anchor_extra, end_frame_offset):
         image = torch.ones((length, height, width, 3), device=device) * 0.5
         if start_image is not None:
             image[:start_image.shape[0]] = start_image
         if end_image is not None:
+            n_end = end_image.shape[0]
+            end_stop = length - end_frame_offset
+            end_start = max(end_stop - n_end, 0)
+
             if end_strength < 1.0:
                 blended = 0.5 + (end_image - 0.5) * end_strength
-                image[-end_image.shape[0]:] = blended
+                image[end_start:end_stop] = blended[:end_stop - end_start]
             else:
-                image[-end_image.shape[0]:] = end_image
+                image[end_start:end_stop] = end_image[:end_stop - end_start]
+
             if end_anchor_extra > 0:
-                ref = image[-end_image.shape[0]]
+                ref = image[end_start]
                 for i in range(1, end_anchor_extra + 1):
-                    idx = -(end_image.shape[0] + i)
-                    if abs(idx) <= length:
+                    idx = end_start - i
+                    if idx >= 0:
                         alpha = 1.0 - (i / (end_anchor_extra + 1.0))
                         image[idx] = image[idx] * (1.0 - alpha) + ref * alpha
         return image
@@ -361,18 +403,27 @@ class SmartPainterFLF2V:
     # Motion amplitude wrapper
     # ------------------------------------------------------------------
     def _apply_amplitude_to_latent(self, encoded_latent, start_image, end_image,
-                                   length, amplitude, vae, device):
-        if start_image is not None and end_image is not None and length > 2:
+                                   length, amplitude, vae, device, end_lat_offset=0):
+        T = encoded_latent.shape[2]
+        end_idx = T - end_lat_offset
+
+        if start_image is not None and end_image is not None and end_idx > 1:
             start_l = encoded_latent[:, :, 0:1]
-            end_l = encoded_latent[:, :, -1:]
-            t = torch.linspace(0.0, 1.0, encoded_latent.shape[2], device=device).view(1, 1, -1, 1, 1)
+            end_l = encoded_latent[:, :, end_idx - 1:end_idx]
+            t = torch.linspace(0.0, 1.0, end_idx, device=device).view(1, 1, -1, 1, 1)
             linear = start_l * (1.0 - t) + end_l * t
-        else:
-            linear = encoded_latent
-        return self._apply_motion_amplitude(
-            encoded_latent, linear, amplitude, vae.latent_channels,
-            start_image, end_image, length,
-        )
+
+            active = encoded_latent[:, :, :end_idx]
+            processed = self._apply_motion_amplitude(
+                active, linear, amplitude, vae.latent_channels,
+                start_image, end_image, length,
+            )
+            if end_lat_offset > 0:
+                result = encoded_latent.clone()
+                result[:, :, :end_idx] = processed
+                return result
+            return processed
+        return encoded_latent
 
     # ------------------------------------------------------------------
     # Motion amplitude: bidirectional
@@ -409,7 +460,8 @@ class SmartPainterFLF2V:
     # Temporal Gaussian smoothing (preserves keyframe latents)
     # ------------------------------------------------------------------
     @staticmethod
-    def _temporal_smooth(latent, sigma, kernel_size, start_image, end_image):
+    def _temporal_smooth(latent, sigma, kernel_size, start_image, end_image,
+                         end_lat_offset=0):
         kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
         if kernel_size < 3:
             return latent
@@ -435,19 +487,22 @@ class SmartPainterFLF2V:
             lat_n = max(1, (n - 1) // 4 + 1)
             smoothed[:, :, :lat_n] = latent[:, :, :lat_n]
         if end_image is not None:
-            n = min(end_image.shape[0], T)
+            end_pos = T - end_lat_offset
+            n = min(end_image.shape[0], end_pos)
             lat_n = max(1, (n - 1) // 4 + 1)
-            smoothed[:, :, -lat_n:] = latent[:, :, -lat_n:]
+            preserve_start = max(end_pos - lat_n, 0)
+            smoothed[:, :, preserve_start:end_pos] = latent[:, :, preserve_start:end_pos]
 
         return smoothed
 
     # ------------------------------------------------------------------
-    # Mask builder with configurable fade/spread and end-anchor fix
+    # Mask builder with fade/spread, end-anchor fix, and offset
     # ------------------------------------------------------------------
     @staticmethod
     def _build_mask(latent_frames, lat_h, lat_w, start_image, end_image, length,
                     fade_frames, fade_min, fade_max,
-                    end_frame_strength, end_anchor_extra, device):
+                    end_frame_strength, end_anchor_extra,
+                    end_frame_offset, device):
         total_pixel_frames = latent_frames * 4
         mask = torch.ones((1, 1, total_pixel_frames, lat_h, lat_w), device=device)
 
@@ -460,8 +515,9 @@ class SmartPainterFLF2V:
         if n_end > 0:
             end_mask_value = 1.0 - end_frame_strength
             end_anchor = n_end + end_anchor_extra
-            end_anchor = min(end_anchor, total_pixel_frames)
-            mask[:, :, -end_anchor:] = end_mask_value
+            anchor_right = total_pixel_frames - end_frame_offset
+            anchor_left = max(anchor_right - end_anchor, 0)
+            mask[:, :, anchor_left:anchor_right] = end_mask_value
 
         if fade_frames > 0:
             if n_start > 0:
@@ -474,7 +530,8 @@ class SmartPainterFLF2V:
 
             if n_end > 0:
                 end_anchor = n_end + end_anchor_extra
-                fade_end_idx = total_pixel_frames - end_anchor
+                anchor_right = total_pixel_frames - end_frame_offset
+                fade_end_idx = anchor_right - end_anchor
                 fade_start_idx = max(fade_end_idx - fade_frames, 0)
                 if n_start > 0:
                     fade_start_idx = max(fade_start_idx, n_start + 3 + fade_frames)

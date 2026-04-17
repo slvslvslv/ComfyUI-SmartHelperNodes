@@ -972,7 +972,8 @@ class SmartPrompt:
                 "text": ("STRING", {"multiline": True, "default": "", "tooltip": "Enter your prompt text. Lines with // comments will be cleaned up. Use { A | B | C } for random selection."}),
             },
             "optional": {
-                "clip": ("CLIP", {"tooltip": "Optional CLIP model for encoding the text."})
+                "clip": ("CLIP", {"tooltip": "Optional CLIP model for encoding the text."}),
+                "seed": ("INT", {"forceInput": True, "tooltip": "Optional seed for deterministic random selections. Same seed always produces the same result."})
             }
         }
 
@@ -982,17 +983,20 @@ class SmartPrompt:
     CATEGORY = "SmartHelperNodes"
 
     @staticmethod
-    def parse_random_syntax(text):
-        """Parses the { A | B | C } syntax and selects a random element."""
+    def parse_random_syntax(text, rng=None):
+        """Parses the { A | B | C } syntax and selects a random element.
+        If rng is provided, uses it for deterministic results; otherwise uses global random."""
+        chooser = rng if rng is not None else random
+
         def replace_match(match):
             # Extract content inside braces and split by '|'
             options = [opt.strip() for opt in match.group(1).split('|')]
             # Return a randomly chosen option
-            return random.choice(options)
+            return chooser.choice(options)
 
         # Regex to find { content } where content contains at least one |
-        # Example: {cat|dog|bird}
-        pattern = r'\{([^}]+?\|[^}]+?)\}'
+        # Allows empty options, e.g. {cat|} means "cat or nothing"
+        pattern = r'\{([^}]*?\|[^}]*?)\}'
         
         # Repeatedly apply substitution until no more matches are found
         # This handles multiple occurrences, e.g., "{a|b} and {c|d}"
@@ -1010,7 +1014,7 @@ class SmartPrompt:
 
         return processed_text
 
-    def process_prompt(self, text, clip=None):
+    def process_prompt(self, text, clip=None, seed=None):
         # 1. Remove comments
         lines = text.splitlines()
         processed_lines = []
@@ -1025,7 +1029,9 @@ class SmartPrompt:
         comment_cleaned_text = "\n".join(processed_lines)
         
         # 2. Process random syntax { A | B | C }
-        processed_text = self.parse_random_syntax(comment_cleaned_text)
+        # Use a seeded local RNG if seed is provided for deterministic results
+        rng = random.Random(seed) if seed is not None else None
+        processed_text = self.parse_random_syntax(comment_cleaned_text, rng=rng)
         
         # 3. Encode if CLIP is provided
         conditioning = None
@@ -1046,12 +1052,13 @@ class SmartPrompt:
         return (processed_text, conditioning)
 
     @classmethod
-    def IS_CHANGED(cls, text, clip=None, **kwargs):
+    def IS_CHANGED(cls, text, clip=None, seed=None, **kwargs):
         # Check if the random syntax { A | B } is present in the input text
         # but ignore patterns that have a comment // before the opening { on the same line
         lines = text.splitlines()
-        pattern = r'\{([^}]+?\|[^}]+?)\}'
+        pattern = r'\{([^}]*?\|[^}]*?)\}'
 
+        has_random_syntax = False
         for line in lines:
             # Skip lines that have // before any { on that line
             comment_pos = line.find('//')
@@ -1060,7 +1067,15 @@ class SmartPrompt:
             # If there's a { and either no // or the // comes after the {
             if brace_pos != -1 and (comment_pos == -1 or comment_pos > brace_pos):
                 if re.search(pattern, line):
-                    return time.time()
+                    has_random_syntax = True
+                    break
+
+        if has_random_syntax:
+            # When seed is provided, the output is deterministic for the same text+seed
+            if seed is not None:
+                return hash((text, seed))
+            # No seed — force re-evaluation every time
+            return time.time()
 
         # Hash the input text to detect changes. Add clip object's potential changes if needed.
         # Note: Hashing the clip object itself might be complex/unreliable.
