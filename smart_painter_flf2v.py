@@ -148,7 +148,7 @@ class SmartPainterFLF2V:
                     ),
                 }),
                 "end_frame_offset": ("INT", {
-                    "default": 0, "min": 0, "max": 80, "step": 4,
+                    "default": 0, "min": 0, "max": 8192, "step": 4,
                     "tooltip": (
                         "DISABLED at 0 — end frame is placed at the very last frame (official behavior).\n"
                         "\n"
@@ -206,8 +206,61 @@ class SmartPainterFLF2V:
             "optional": {
                 "clip_vision_start_image": ("CLIP_VISION_OUTPUT",),
                 "clip_vision_end_image": ("CLIP_VISION_OUTPUT",),
+                "clip_vision_reference_image": ("CLIP_VISION_OUTPUT", {
+                    "tooltip": (
+                        "Optional third CLIP Vision slot for an off-screen reference image "
+                        "(subject identity, clothing, object that isn't in start/end frames).\n"
+                        "\n"
+                        "Merged with clip_vision_start_image and clip_vision_end_image by "
+                        "concatenating their token sequences along the token axis. "
+                        "Feeds the model's img_emb cross-attention pathway — the only non-keyframe "
+                        "image-guidance channel available on stock WAN 2.2 base checkpoints "
+                        "(no VACE / no ref_conv required).\n"
+                        "\n"
+                        "Provides semantic / style / identity guidance. NOT pixel-faithful — "
+                        "good for 'keep the jacket this color', weak for 'reproduce this exact logo'.\n"
+                        "\n"
+                        "Leave unconnected to keep the original pipeline unchanged."
+                    ),
+                }),
+                "cv_reference_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05,
+                    "tooltip": (
+                        "Only active when clip_vision_reference_image is connected.\n"
+                        "\n"
+                        "Scales the reference image's CLIP token magnitudes before they are merged "
+                        "with the start/end CLIP tokens. Higher values make the reference dominate "
+                        "the cross-attention, lower values let start/end guidance win.\n"
+                        "\n"
+                        "0.0 = reference disabled (same as leaving clip_vision_reference_image "
+                        "unconnected).\n"
+                        "1.0 = equal weight with start/end (one reference token = one start/end token).\n"
+                        "2.0-3.0 = reference boosted (useful if the reference subject is being "
+                        "ignored by the model).\n"
+                        "\n"
+                        "Defaults to 1.0."
+                    ),
+                }),
                 "start_image": ("IMAGE",),
                 "end_image": ("IMAGE",),
+                "initial_reference_image": ("IMAGE", {
+                    "tooltip": (
+                        "Optional VAE-encoded reference injected as a reference_latent conditioning key.\n"
+                        "\n"
+                        "NOTE: Only effective on WAN checkpoints that ship with a ref_conv layer "
+                        "(Fun Control, Animate, SCAIL, HuMo, VACE-merged). "
+                        "Silently ignored by stock WAN 2.2 FLF2V / I2V / T2V and most custom merges. "
+                        "For a reference-image channel that works on any base WAN 2.2 checkpoint, "
+                        "use clip_vision_reference_image above instead.\n"
+                        "\n"
+                        "Encoded via the VAE and appended to the conditioning's reference_latents list "
+                        "(a zero latent is appended on the negative side). "
+                        "Acts as a persistent identity/style anchor across the whole clip, "
+                        "independent of start_image and end_image.\n"
+                        "\n"
+                        "Leave unconnected to keep the original pipeline unchanged."
+                    ),
+                }),
             },
         }
 
@@ -246,6 +299,9 @@ class SmartPainterFLF2V:
         end_image=None,
         clip_vision_start_image=None,
         clip_vision_end_image=None,
+        clip_vision_reference_image=None,
+        cv_reference_strength=1.0,
+        initial_reference_image=None,
     ):
         end_frame_offset = (end_frame_offset // 4) * 4
         end_frame_offset = min(end_frame_offset, length - 2)
@@ -355,7 +411,12 @@ class SmartPainterFLF2V:
             negative, {"concat_latent_image": concat_high, "concat_mask": mask_high},
         )
 
-        clip_vision_output = self._merge_clip_vision(clip_vision_start_image, clip_vision_end_image)
+        scaled_reference = self._scale_clip_vision(
+            clip_vision_reference_image, cv_reference_strength,
+        )
+        clip_vision_output = self._merge_clip_vision(
+            clip_vision_start_image, clip_vision_end_image, scaled_reference,
+        )
         if clip_vision_output is not None:
             positive_high = node_helpers.conditioning_set_values(
                 positive_high, {"clip_vision_output": clip_vision_output},
@@ -365,6 +426,23 @@ class SmartPainterFLF2V:
             )
             negative_out = node_helpers.conditioning_set_values(
                 negative_out, {"clip_vision_output": clip_vision_output},
+            )
+
+        if initial_reference_image is not None:
+            ref_img = comfy.utils.common_upscale(
+                initial_reference_image[:1].movedim(-1, 1),
+                width, height, "bilinear", "center",
+            ).movedim(1, -1)
+            ref_latent = vae.encode(ref_img[:, :, :, :3])
+            neg_ref_latent = torch.zeros_like(ref_latent)
+            positive_high = node_helpers.conditioning_set_values(
+                positive_high, {"reference_latents": [ref_latent]}, append=True,
+            )
+            positive_low = node_helpers.conditioning_set_values(
+                positive_low, {"reference_latents": [ref_latent]}, append=True,
+            )
+            negative_out = node_helpers.conditioning_set_values(
+                negative_out, {"reference_latents": [neg_ref_latent]}, append=True,
             )
 
         return (positive_high, positive_low, negative_out, {"samples": latent})
@@ -554,6 +632,20 @@ class SmartPainterFLF2V:
         result = comfy.clip_vision.Output()
         result.penultimate_hidden_states = states
         return result
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _scale_clip_vision(output, strength):
+        if output is None or strength <= 0.0:
+            return None
+        if abs(strength - 1.0) < 1e-6:
+            return output
+        scaled = comfy.clip_vision.Output()
+        scaled.penultimate_hidden_states = output.penultimate_hidden_states * strength
+        for attr in ("image_embeds", "last_hidden_state", "mm_projected", "image_sizes"):
+            if hasattr(output, attr):
+                setattr(scaled, attr, getattr(output, attr))
+        return scaled
 
 
 NODE_CLASS_MAPPINGS = {
